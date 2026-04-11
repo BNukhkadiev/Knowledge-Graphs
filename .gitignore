@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+v1/
+notes/
+
+# Experiment outputs (trained models, logs, walk dumps, metrics, etc.)
+output/
+wandb/
+mlruns/
+
+# Cursor IDE (local workspace/agent state — not shared across clones)
+.cursor/
+
+# LaTeX: only version seminar.tex and references.bib; ignore build artifacts
+latex/**
+!latex/references.bib
+!latex/seminar.tex
