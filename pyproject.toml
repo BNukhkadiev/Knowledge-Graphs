@@ -1,0 +1,14 @@
+[project]
+name = "knowledge-graphs"
+version = "0.1.0"
+description = "Learning Knowledge Graphs & Graph Learning"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "gensim>=4.4.0",
+    "matplotlib>=3.10.8",
+    "pandas>=3.0.2",
+    "scikit-learn>=1.4",
+    "torch>=2.2",
+    "tqdm>=4.66",
+]
