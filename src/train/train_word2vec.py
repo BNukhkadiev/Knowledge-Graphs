@@ -55,13 +55,19 @@ class Word2VecWithStepLoss(Word2Vec):
         self._job_step += 1
         cum = float(self.running_training_loss)
         if self._job_step % self.step_loss_interval == 0:
+            interval = cum - self._cum_at_last_interval
             self.step_loss_rows.append(
                 (
                     self._job_step,
                     self.train_epoch_idx,
                     cum,
-                    cum - self._cum_at_last_interval,
+                    interval,
                 )
+            )
+            tqdm.write(
+                f"[step loss] step={self._job_step} epoch={self.train_epoch_idx} "
+                f"cumulative={cum:.6f} interval={interval:.6f}",
+                file=sys.stdout,
             )
             self._cum_at_last_interval = cum
         return tally, raw_tally
