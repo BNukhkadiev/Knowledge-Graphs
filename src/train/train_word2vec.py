@@ -372,6 +372,8 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
                 )
         else:
             pre_workers = _workers_effective(args.workers)
+        pre_lr = args.pretrain_lr if args.pretrain_lr is not None else args.lr
+        pre_min_alpha = args.pretrain_min_alpha if args.pretrain_min_alpha is not None else args.min_alpha
         pre_model, pretrain_losses = train_word2vec_stage(
             args.pretrain_walks,
             vector_size=args.dim,
@@ -382,8 +384,8 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
             negative=args.negative,
             epochs=args.pretrain_epochs,
             seed=args.seed,
-            alpha=args.lr,
-            min_alpha=args.min_alpha,
+            alpha=pre_lr,
+            min_alpha=pre_min_alpha,
             desc="Stage 1 pretrain",
             step_loss_interval=st_interval,
             step_loss_quiet=st_quiet,
@@ -443,6 +445,10 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
     ft_workers = 1 if finetune_loss_every > 0 else _workers_effective(args.workers)
     pre_model.workers = ft_workers
 
+    # Finetune uses --lr / --min-alpha (independent of stage-1 pretrain-lr / pretrain-min-alpha).
+    pre_model.alpha = args.lr
+    pre_model.min_alpha = args.min_alpha
+
     ft_loss_cb = EpochLossProgress(
         total_epochs=args.finetune_epochs,
         desc="Stage 2 finetune",
@@ -476,6 +482,25 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
         callbacks=ft_callbacks,
     )
     finetune_losses = ft_loss_cb.epoch_losses
+
+    if not args.skip_pretrain and pretrain_losses is not None and len(pretrain_losses) > 0:
+        pre_csv = out_dir / "pretrain_loss.csv"
+        save_loss_csv(pre_csv, pretrain_losses)
+        print(f"Wrote pretrain loss log: {pre_csv}")
+    if finetune_losses:
+        ft_csv = out_dir / "finetune_loss.csv"
+        save_loss_csv(ft_csv, finetune_losses)
+        print(f"Wrote finetune loss log: {ft_csv}")
+    if not args.skip_pretrain and pretrain_loss_every > 0 and pretrain_step_rows:
+        pre_steps = out_dir / "pretrain_loss_steps.csv"
+        save_step_loss_csv(pre_steps, pretrain_step_rows)
+        print(f"Wrote pretrain step loss log: {pre_steps}")
+    if finetune_loss_every > 0 and step_model_ok and isinstance(pre_model, Word2VecWithStepLoss):
+        ft_rows = pre_model.step_loss_rows
+        if ft_rows:
+            ft_steps = out_dir / "finetune_loss_steps.csv"
+            save_step_loss_csv(ft_steps, ft_rows)
+            print(f"Wrote finetune step loss log: {ft_steps}")
 
     if not args.no_loss_plots:
         pre_ep = (
@@ -735,6 +760,18 @@ def main() -> None:
         type=float,
         default=0.0001,
         help="Minimum learning rate after linear decay (min_alpha)",
+    )
+    p.add_argument(
+        "--pretrain-lr",
+        type=float,
+        default=None,
+        help="Stage-1 initial alpha (--mode p1/p2 only; default: same as --lr)",
+    )
+    p.add_argument(
+        "--pretrain-min-alpha",
+        type=float,
+        default=None,
+        help="Stage-1 min_alpha (--mode p1/p2 only; default: same as --min-alpha)",
     )
     p.add_argument(
         "--workers",

@@ -153,7 +153,10 @@ def generate_duplicate_free_random_walks_for_entity(
 
     Forward-only: each hop follows ``lastTriple.object`` as the next subject.
     After each depth step, if more than ``number_of_walks`` chains exist, trim
-    by uniformly random removal until the count fits.
+    with ``random.Random.sample`` — same uniform distribution over
+    ``number_of_walks``-sized subsets as repeated ``pop(randrange(len))``, but
+    not the same RNG stream (per-seed output can differ from a sequential-pop
+    implementation).
     """
     walks: list[list[Triple]] = []
     for current_depth in range(depth):
@@ -164,16 +167,18 @@ def generate_duplicate_free_random_walks_for_entity(
             for t in neighbours:
                 walks.append([t])
         else:
-            walks_tmp = list(walks)
-            for walk in walks_tmp:
+            new_walks: list[list[Triple]] = []
+            for walk in walks:
                 last_triple = walk[-1]
                 next_iteration = adj_by_subject.get(last_triple.object)
                 if next_iteration is not None:
-                    walks.remove(walk)
                     for next_step in next_iteration:
-                        walks.append(walk + [next_step])
-        while len(walks) > number_of_walks:
-            walks.pop(rng.randrange(len(walks)))
+                        new_walks.append(walk + [next_step])
+                else:
+                    new_walks.append(walk)
+            walks = new_walks
+        if len(walks) > number_of_walks:
+            walks = rng.sample(walks, number_of_walks)
     return walks
 
 
