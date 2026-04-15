@@ -13,6 +13,7 @@ Example:
   uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --dry-run
   uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --limit 3
   uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --random-search --limit 20
+  uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --jobs 4
 """
 
 from __future__ import annotations
@@ -27,6 +28,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -463,6 +467,76 @@ def run_one(
         run_cmd(eval_argv, cwd=root, dry_run=dry_run, log_path=eval_log)
 
 
+@dataclass(frozen=True)
+class GridRunOutcome:
+    run_index: int
+    training_mode: str
+    flat: dict[str, Any]
+    test_accuracy: float | None
+    manifest_status: str
+    sys_exit_code: int | None
+    reraise: Exception | None
+
+
+def _execute_grid_point(
+    *,
+    run_index: int,
+    tm: str,
+    flat: dict[str, Any],
+    paths: dict[str, Path],
+    out_dir: Path,
+    dry_run: bool,
+    no_eval: bool,
+    workers: int | None,
+    seed: int | None,
+) -> GridRunOutcome:
+    """Run one grid point; mirrors main()'s per-run try/except for subprocess and other errors."""
+    try:
+        run_one(
+            run_index=run_index,
+            tm=tm,
+            flat=flat,
+            paths=paths,
+            out_dir=out_dir,
+            dry_run=dry_run,
+            no_eval=no_eval,
+            workers=workers,
+            seed=seed,
+        )
+        acc: float | None = None
+        if not no_eval and not dry_run:
+            acc = parse_accuracy_from_eval_log(out_dir / f"run_{run_index:04d}" / "eval_metrics.txt")
+        return GridRunOutcome(
+            run_index=run_index,
+            training_mode=tm,
+            flat=flat,
+            test_accuracy=acc,
+            manifest_status="ok",
+            sys_exit_code=None,
+            reraise=None,
+        )
+    except subprocess.CalledProcessError as e:
+        return GridRunOutcome(
+            run_index=run_index,
+            training_mode=tm,
+            flat=flat,
+            test_accuracy=None,
+            manifest_status=f"error: exit {e.returncode}",
+            sys_exit_code=e.returncode,
+            reraise=None,
+        )
+    except Exception as e:
+        return GridRunOutcome(
+            run_index=run_index,
+            training_mode=tm,
+            flat=flat,
+            test_accuracy=None,
+            manifest_status=f"error: {e!s}",
+            sys_exit_code=None,
+            reraise=e,
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Run grid or random search from YAML for a TC under v1/synthetic_ontology/<TC>/.",
@@ -524,6 +598,17 @@ def main() -> None:
         default=None,
         help="Forwarded to train_word2vec.py --seed",
     )
+    ap.add_argument(
+        "--jobs",
+        "-j",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Run up to N grid points concurrently (default: 1). Each run uses its own run_* directory. "
+            "Combine with --workers for Gensim threads per training job; total CPU use is roughly N × workers."
+        ),
+    )
     args = ap.parse_args()
     root = repo_root()
     cfg_path = args.config if args.config.is_absolute() else root / args.config
@@ -566,6 +651,7 @@ def main() -> None:
             "search": search_label,
             "random_seed": args.random_seed if args.random_search else None,
             "n_runs": len(runs),
+            "parallel_jobs": args.jobs,
         }
         (out_root / "run_meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
@@ -608,54 +694,110 @@ def main() -> None:
     label = "Random trials" if args.random_search else "Grid points"
     print(f"{label}: {len(runs)}  →  {out_root}", file=sys.stderr)
 
+    if args.jobs < 1:
+        raise SystemExit("--jobs must be >= 1")
+
     best_acc: float | None = None
     best_run_idx: int | None = None
+    best_lock = threading.Lock()
 
-    pbar = tqdm(
-        enumerate(runs, start=1),
-        total=len(runs),
-        desc="grid search",
-        unit="run",
-        dynamic_ncols=True,
-        file=sys.stderr,
-        leave=True,
-    )
-    for i, (tm, flat) in pbar:
-        pbar.set_description_str(f"[{i}/{len(runs)}] {tm}", refresh=False)
-        acc: float | None = None
-        try:
-            run_one(
-                run_index=i,
-                tm=tm,
-                flat=flat,
-                paths=paths,
-                out_dir=out_root,
-                dry_run=args.dry_run,
-                no_eval=args.no_eval,
-                workers=args.workers,
-                seed=args.seed,
+    def update_postfix(pbar: tqdm, outcome: GridRunOutcome) -> None:
+        nonlocal best_acc, best_run_idx
+        acc = outcome.test_accuracy
+        with best_lock:
+            if acc is not None and (best_acc is None or acc > best_acc):
+                best_acc = acc
+                best_run_idx = outcome.run_index
+            ba, br = best_acc, best_run_idx
+        postfix: dict[str, str] = {}
+        if not args.no_eval:
+            postfix["last"] = f"{acc:.4f}" if acc is not None else "—"
+            postfix["best"] = f"{ba:.4f}" if ba is not None else "—"
+            if br is not None:
+                postfix["best@"] = f"run_{br:04d}"
+        else:
+            postfix["eval"] = "off"
+        pbar.set_postfix(postfix, refresh=True)
+
+    def handle_outcome(pbar: tqdm, outcome: GridRunOutcome, *, manifest_lock: threading.Lock | None) -> None:
+        """Write manifest row; update tqdm; re-raise or exit like the original sequential loop."""
+        def do_write() -> None:
+            write_manifest_row(
+                outcome.run_index,
+                outcome.training_mode,
+                outcome.flat,
+                outcome.manifest_status,
+                test_accuracy=outcome.test_accuracy,
             )
-            if not args.no_eval and not args.dry_run:
-                acc = parse_accuracy_from_eval_log(out_root / f"run_{i:04d}" / "eval_metrics.txt")
-                if acc is not None and (best_acc is None or acc > best_acc):
-                    best_acc = acc
-                    best_run_idx = i
-            postfix: dict[str, str] = {}
-            if not args.no_eval:
-                postfix["last"] = f"{acc:.4f}" if acc is not None else "—"
-                postfix["best"] = f"{best_acc:.4f}" if best_acc is not None else "—"
-                if best_run_idx is not None:
-                    postfix["best@"] = f"run_{best_run_idx:04d}"
-            else:
-                postfix["eval"] = "off"
-            pbar.set_postfix(postfix, refresh=True)
-            write_manifest_row(i, tm, flat, "ok", test_accuracy=acc)
-        except subprocess.CalledProcessError as e:
-            write_manifest_row(i, tm, flat, f"error: exit {e.returncode}")
-            raise SystemExit(e.returncode) from e
-        except Exception as e:
-            write_manifest_row(i, tm, flat, f"error: {e!s}")
+
+        if manifest_lock is not None:
+            with manifest_lock:
+                do_write()
+        else:
+            do_write()
+        update_postfix(pbar, outcome)
+        if outcome.reraise is not None:
+            raise outcome.reraise
+        if outcome.sys_exit_code is not None:
+            raise SystemExit(outcome.sys_exit_code)
+
+    common_kw = dict(
+        paths=paths,
+        out_dir=out_root,
+        dry_run=args.dry_run,
+        no_eval=args.no_eval,
+        workers=args.workers,
+        seed=args.seed,
+    )
+
+    if args.jobs == 1:
+        pbar = tqdm(
+            enumerate(runs, start=1),
+            total=len(runs),
+            desc="grid search",
+            unit="run",
+            dynamic_ncols=True,
+            file=sys.stderr,
+            leave=True,
+        )
+        for i, (tm, flat) in pbar:
+            pbar.set_description_str(f"[{i}/{len(runs)}] {tm}", refresh=False)
+            outcome = _execute_grid_point(run_index=i, tm=tm, flat=flat, **common_kw)
+            handle_outcome(pbar, outcome, manifest_lock=None)
+    else:
+        tasks = [(i, tm, flat) for i, (tm, flat) in enumerate(runs, start=1)]
+        manifest_lock = threading.Lock()
+        pbar = tqdm(
+            total=len(runs),
+            desc="grid search",
+            unit="run",
+            dynamic_ncols=True,
+            file=sys.stderr,
+            leave=True,
+        )
+        executor = ThreadPoolExecutor(max_workers=args.jobs)
+        try:
+            future_map = {}
+            for i, tm, flat in tasks:
+                fut = executor.submit(
+                    _execute_grid_point,
+                    run_index=i,
+                    tm=tm,
+                    flat=flat,
+                    **common_kw,
+                )
+                future_map[fut] = (i, tm)
+            for fut in as_completed(future_map):
+                i, tm = future_map[fut]
+                pbar.set_description_str(f"[done {i}/{len(runs)}] {tm}", refresh=False)
+                outcome = fut.result()
+                handle_outcome(pbar, outcome, manifest_lock=manifest_lock)
+                pbar.update(1)
+        except BaseException:
+            executor.shutdown(wait=False, cancel_futures=True)
             raise
+        else:
+            executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":
