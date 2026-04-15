@@ -4,6 +4,7 @@
 % some useful packages (add more as needed)
 \usepackage[utf8]{inputenc}
 \usepackage{graphicx}
+\usepackage{subcaption}
 \usepackage{latexsym}
 \usepackage{amsmath}
 \usepackage{amssymb}
@@ -34,9 +35,8 @@
 
 \begin{abstract}
 
-Your report must contain an abstract. A good reference for report writing
-is~\citet{zobel2014}; we highly recommend that you study this or a similar book
-during your studies. He writes the following about the abstract. 
+Here goes the abstract. It should be a concise summary of the paper, including the main motivation, methods, results, and conclusions. 
+The abstract should be no more than 250 words and should be self-contained, meaning that it should make sense to a reader who has not read the rest of the paper.
 
 \end{abstract}
 
@@ -44,7 +44,6 @@ during your studies. He writes the following about the abstract.
 \label{ch:intro}
 
 Intro here. 
-
 
 
 \section{Literature Review}
@@ -162,11 +161,7 @@ It is often used in the context of large graphs, where it is not feasible to pro
 
 
 
-
-
-
-
-\section{Evaluating RDF2Vec on Complex Datasets}
+\section{Evaluating RDF2Vec on DLCC}
 RDF2Vec models have demonstrated significant potential on benchmark datasets such as DLCC. 
 That said, they have not yet been evaluated on more complex datasets.
 
@@ -179,33 +174,31 @@ On the other hand, as a strong baseline to beat we will use TransE-L2 model.
 \newcommand{\D}{\textemdash{}}
 \begin{table}[t]
   \centering
-  \caption{DLCC (synthetic ontology): binary node classification with a logistic regression on frozen entity vectors. All entries are \textbf{accuracy} on the test set, reported as point estimate $\pm$ bootstrap standard error. Within each setup, columns compare embedding sources.}
+  \caption{RDF2Vec on DLCC (synthetic ontology): binary node classification with a logistic regression on frozen entity vectors. All entries are \textbf{accuracy} on the test set, reported as point estimate $\pm$ bootstrap standard error. Within each setup, columns compare embedding sources.}
   \label{tab:dlcc-rdf2vec}
   \footnotesize
   \setlength{\tabcolsep}{6pt}
-  \begin{tabular}{@{}lcccc@{}}
+  \begin{tabular}{@{}lcc@{}}
     \toprule
     Test case
-      & Random init
-      & RDF2Vec
-      & ComplEx
-      & TransE \\
+      & Random Walks
+      & WL Kernel Walks \\
     \midrule
-    TC01 & \D & \D & \D & \D \\
-    TC02 & \D & \D & \D & \D \\
-    TC03 & \D & \D & \D & \D \\
-    TC04 & \D & \D & \D & \D \\
-    TC05 & \D & \D & \D & \D \\
-    TC06 & \D & \D & \D & \D \\
-    TC07 & 0.507 & \D & \D & \D \\
-    TC08 & \D & \D & \D & \D \\
-    TC09 & \D & \D & \D & \D \\
-    TC10 & \D & \D & \D & \D \\
-    TC11 & \D & \D & \D & \D \\
-    TC12 & \D & \D & \D & \D \\
+    TC01 & 0.867 & \D \\
+    TC02 & 0.725 & \D \\
+    TC03 & \D & \D \\
+    TC04 & \D & \D \\
+    TC05 & \D & \D \\
+    TC06 & \D & \D \\
+    TC07 & 0.552 & \D \\
+    TC08 & 0.597 & \D \\
+    TC09 & 0.612 & \D \\
+    TC10 & 0.630 & \D \\
+    TC11 & 0.610 & \D \\
+    TC12 & 0.640 & \D \\
     \midrule
     Macro avg.
-      & \D & \D & \D & \D \\
+      & \D & \D \\
     \bottomrule
   \end{tabular}
   \vspace{0.4em}
@@ -214,12 +207,162 @@ On the other hand, as a strong baseline to beat we will use TransE-L2 model.
 
 \endgroup
 
+The DLCC dataset's synthetic ontology is a highly problematic dataset due to the fact that model scores vary significantly across runs.
+This is a problem because it makes it difficult to draw conclusions about the performance of RDF2Vec models on the DLCC dataset.
+To address this issue, we will run multiple runs of RDF2Vec models on each test case (TC01--TC12).
 
+Nevertheless, we see that RDF2Vec models start to struggle with more complex test cases such as TC07--TC12. 
 
 \section{Pretraining a Protograph for RDF2Vec}
 
-We can notice that when training RDF2Vec models we only use the instance graph and not utilize the ontology graph. This is a missed opportunity, as the ontology graph contains valuable information about the structure and semantics of the data. 
-To address this, we propose pretraining RDF2Vec models on the ontology graph before fine-tuning them on the instance graph. This approach is inspired by the success of pretraining in other domains, such as natural language processing. 
+We can notice that when training RDF2Vec models we only use the instance graph and not utilize the ontology graph. 
+This is a missed opportunity, as the ontology graph contains valuable information about the structure and semantics of the data. 
+To address this, we propose pretraining RDF2Vec models on the ontology graph before fine-tuning them on the instance graph. 
+This approach is inspired by the success of pretraining in other domains, such as natural language processing. 
+
+So roughly, injecting schema-based information into the training could help enhance the semantic awareness of KG embeddings \cite{hubert2024treatdifferentnegativesdifferently}.
+
+
+P1 protograph seems to be absolutely useless judging from the results presented in Table 4 \cite{hubert2024treatdifferentnegativesdifferently}. 
+We reference Table 4 specifically because it has results for Node classification task on 12 DLCC synthetic test cases. 
+
+P2 is a little more promising, however it can clearly be seen that it is unstable and sometimes shows ~10\% improvement and sometimes ~10\% degradation.
+
+\subsection{Building Protograph}
+
+
+\subsection{Training on Protograph}
+
+So far training on P1 protograph is quite unstable that might be due to the fact that it has too little data. Another drawback of P1 strategy is also pointed out in original paper:
+if schema has many abstract classes that do not have any direct instances, then embeddings of these classes will not be trasferred to the instance embeddings. Thus, resulting in inefficient pretraining. 
+
+The initial results of training on P2 and P1 protographs are not as promising as we hoped. Maybe to make it work we need to perform a more careful hyperparameter tuning. 
+For that we start a hyperparameter grid search. For each difficult TC (TC07--TC12) we will run 5 runs of RDF2Vec with different hyperparameters and report the best results.
+
+We will tune hyperparameters for 2 stages in the pipeline: (i) walks generation and (ii) Word2Vec training. 
+Walks generation hyperparameters include: (a) depth, (b) walks per entity. We include only these parameters because we focus on jRDF2Vec implementation for now. 
+We will cover other params later. 
+
+Word2Vec training hyperparameters include: (a) embedding dimension, (b) window size, (c) negative samples, (d) min count, (e) skipgram or CBOW, (f) epochs, (g) learning rate.
+
+Table \ref{tab:dlcc-rdf2vec-protograph} shows the results of RDF2Vec models pretrained on P1 and P2 protographs.
+
+\begingroup
+\newcommand{\D}{\textemdash{}}
+\begin{table}[t]
+  \centering
+  \caption{RDF2Vec on DLCC (synthetic ontology) under protograph pretraining: binary node classification with a logistic regression on frozen entity vectors.}
+  \label{tab:dlcc-rdf2vec-protograph}
+  \footnotesize
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    Test case
+      & No protograph
+      & P1
+      & P2 \\
+    \midrule
+    TC01 & 0.867 & \D & \D \\
+    TC02 & 0.725 & \D & \D \\
+    TC03 & 0.762 & \D & \D \\
+    TC04 & 0.997 & \D & \D \\ % Too long to run so we won't add more. Also it's useless beacuse it's a very easy test case.
+    TC05 & 0.817 & \D & \D \\
+    TC06 & 0.962 & \D & \D \\
+    TC07 & 0.552 & 0.590 & 0.640 \\
+    TC08 & 0.597 & 0.580 & 0.672 \\
+    TC09 & 0.612 & 0.610 & 0.657 \\
+    TC10 & 0.630 & 0.597 & 0.670 \\
+    TC11 & 0.610 & 0.597 & 0.590 \\
+    TC12 & 0.640 & 0.652 & 0.700 \\
+    \midrule
+    Macro avg.
+      & \D & \D & \D \\
+    \bottomrule
+  \end{tabular}
+  \vspace{0.4em}
+  \par\noindent\small\textit{Note:} Macro avg.\ is the unweighted mean of accuracy over TC01--TC12 for each column. Replace placeholders with $m \pm \sigma$ once runs are complete.
+\end{table}
+\endgroup
+
+
+\subsection{Convergence of Protograph Pretrained Model}
+We analyze how quickly Word2Vec training on the instance-graph walks reduces loss when embeddings are initialized in three ways:
+\textit{V} denotes training from scratch (no protograph pretraining), while \textit{P1} and \textit{P2} denote fine-tuning after protograph pretraining with strategies P1 and P2, respectively.
+For each difficult test case TC07--TC10, Figure~\ref{fig:protograph-convergence-loss} plots the \emph{interval} training loss (Gensim cumulative loss difference between consecutive logging steps) against the batch step index during Word2Vec training on the instance corpus.
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{assets/tc07_loss_per_step_v_p1_p2.png}
+    \caption{}
+  \end{subfigure}\hfill
+  \begin{subfigure}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{assets/tc08_loss_per_step_v_p1_p2.png}
+    \caption{}
+  \end{subfigure}
+
+  \vspace{0.6em}
+
+  \begin{subfigure}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{assets/tc09_loss_per_step_v_p1_p2.png}
+    \caption{}
+  \end{subfigure}\hfill
+  \begin{subfigure}{0.48\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{assets/tc10_loss_per_step_v_p1_p2.png}
+    \caption{}
+  \end{subfigure}
+  \caption{Interval Word2Vec loss vs.\ training step on the instance walks for TC07--TC10. Curves compare no pretraining (\textit{V}) with fine-tuning after P1 and P2 protograph pretraining.}
+  \label{fig:protograph-convergence-loss}
+\end{figure}
+
+
+\subsection{Evaluating Protograph Embeddings}
+So far we have covered (i) the evaluation of RDF2Vec trained on protographs and on instance graph, 
+(ii) convergence of RDF2Vec on instance graph with prograph embeddings initialization.
+
+In order to analyze the pretrained embeddings deeper we evaluate them on DLCC test cases as shown in Table~\ref{tab:dlcc-protograph-embeddings-eval}.
+\textit{Random} denotes RDF2Vec trained with a random initialization of embedding weights (no protograph pretraining); \textit{P1} and \textit{P2} use weights initialized from the corresponding protograph pretraining runs before fine-tuning on the instance graph.
+
+\begingroup
+\newcommand{\D}{\textemdash{}}
+\begin{table}[t]
+  \centering
+  \caption{Pretrained protograph embeddings evaluated on DLCC: binary node classification with a logistic regression on frozen entity vectors. Accuracy on the test set.}
+  \label{tab:dlcc-protograph-embeddings-eval}
+  \footnotesize
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    TC & Random & P1 & P2 \\
+    \midrule
+    TC01 & \D & \D & \D \\
+    TC02 & \D & \D & \D \\
+    TC03 & \D & \D & \D \\
+    TC04 & \D & \D & \D \\
+    TC05 & \D & \D & \D \\
+    TC06 & \D & \D & \D \\
+    TC07 & \D & \D & \D \\
+    TC08 & \D & \D & \D \\
+    TC09 & \D & \D & \D \\
+    TC10 & \D & \D & \D \\
+    TC11 & \D & \D & \D \\
+    TC12 & \D & \D & \D \\
+    \midrule
+    Macro avg.
+      & \D & \D & \D \\
+    \bottomrule
+  \end{tabular}
+  \vspace{0.4em}
+  \par\noindent\small\textit{Note:} Macro avg.\ is the unweighted mean of accuracy over TC01--TC12 for the Random column; P1/P2 averages are omitted until all test cases are filled. Replace entries with $m \pm \sigma$ once runs are complete.
+\end{table}
+\endgroup
+
+
+
 
 
 
@@ -227,6 +370,7 @@ To address this, we propose pretraining RDF2Vec models on the ontology graph bef
 % What would be the loss function? 
 % 
 
+\section{Problems of RDF2Vec}
 
 
 
