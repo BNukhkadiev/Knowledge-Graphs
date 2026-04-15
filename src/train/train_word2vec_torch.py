@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Train Word2Vec-style embeddings from a walks file (one space-separated walk per line).
+Train Word2Vec-style embeddings from walks (one space-separated walk per line).
 
-Supports skip-gram or CBOW with negative sampling in PyTorch so training can run on CUDA
-or Apple MPS when available. Optional initialization from a prior checkpoint produced by this
-script (--pretrained). Progress is shown with tqdm.
+Modes (--mode):
+  none — Train on one walks file; optional --pretrained for overlapping vocab init.
+  p1, p2 — Two-stage: pretrain on protograph P1 or P2 walks, then finetune on instance walks
+           (initialize overlapping tokens from stage-1 checkpoint).
+
+Skip-gram or CBOW with negative sampling; runs on CUDA or Apple MPS when available.
 """
 
 from __future__ import annotations
@@ -19,6 +22,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
+
+
+def count_lines(path: Path) -> int:
+    with path.open(encoding="utf-8") as f:
+        return sum(1 for _ in f)
 
 
 def load_walks(path: Path) -> list[list[str]]:
@@ -271,51 +279,21 @@ def load_pretrained_embeddings(
     return n_copied
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="Train Word2Vec from a walks file (PyTorch, GPU-capable).")
-    p.add_argument("walks", type=Path, help="Walks file: one space-separated walk per line")
-    p.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        default=Path("word2vec.pt"),
-        help="Output checkpoint (.pt) with embeddings and vocabulary",
-    )
-    p.add_argument(
-        "--architecture",
-        "--arch",
-        dest="architecture",
-        choices=("skipgram", "cbow"),
-        default="skipgram",
-        help="Word2Vec variant: skip-gram (center predicts context) or CBOW (context predicts center)",
-    )
-    p.add_argument(
-        "--pretrained",
-        type=Path,
-        default=None,
-        help="Initialize in/out embeddings from a .pt checkpoint from this script (overlapping vocab only)",
-    )
-    p.add_argument("--dim", type=int, default=128, help="Embedding dimension")
-    p.add_argument("--window", type=int, default=5, help="Context window size (each side)")
-    p.add_argument("--epochs", type=int, default=5, help="Training epochs")
-    p.add_argument("--batch-size", type=int, default=4096, help="Batch size (pairs per step)")
-    p.add_argument("--negative", type=int, default=5, help="Number of negative samples per pair")
-    p.add_argument("--min-count", type=int, default=1, help="Ignore tokens with count below this")
-    p.add_argument("--lr", type=float, default=0.025, help="Learning rate")
-    p.add_argument("--seed", type=int, default=None, help="Random seed")
-    p.add_argument(
-        "--device",
-        choices=("auto", "cpu", "cuda", "mps"),
-        default="auto",
-        help="Device: auto picks CUDA, then MPS, then CPU",
-    )
-    args = p.parse_args()
-
+def train_torch_on_walks(
+    walks_path: Path,
+    output_path: Path,
+    args: argparse.Namespace,
+    *,
+    epochs: int,
+    pretrained_path: Path | None = None,
+    desc_suffix: str = "",
+) -> None:
+    """Train one Word2Vec stage; optionally initialize embedding rows from ``pretrained_path``."""
     pre_ckpt: dict | None = None
-    if args.pretrained is not None:
-        if not args.pretrained.is_file():
-            raise SystemExit(f"--pretrained not found: {args.pretrained}")
-        pre_ckpt = torch.load(args.pretrained, map_location="cpu", weights_only=False)
+    if pretrained_path is not None:
+        if not pretrained_path.is_file():
+            raise SystemExit(f"Pretrained checkpoint not found: {pretrained_path}")
+        pre_ckpt = torch.load(pretrained_path, map_location="cpu", weights_only=False)
         if "dim" in pre_ckpt and int(pre_ckpt["dim"]) != args.dim:
             raise SystemExit(
                 f"Checkpoint dim ({pre_ckpt['dim']}) does not match --dim ({args.dim}). "
@@ -327,9 +305,9 @@ def main() -> None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
 
-    walks = load_walks(args.walks)
+    walks = load_walks(walks_path)
     if not walks:
-        raise SystemExit("No walks found in input file.")
+        raise SystemExit(f"No walks found in {walks_path}")
 
     word2idx, idx2word, freqs = build_vocab(walks, args.min_count)
     idx_sentences = [walk_to_indices(s, word2idx) for s in walks]
@@ -354,20 +332,24 @@ def main() -> None:
         model = CBOWNeg(vocab_size, args.dim).to(device)
 
     if pre_ckpt is not None:
-        n_init = load_pretrained_embeddings(model, word2idx, ckpt=pre_ckpt, pretrained_path=args.pretrained)
+        assert pretrained_path is not None
+        n_init = load_pretrained_embeddings(
+            model, word2idx, ckpt=pre_ckpt, pretrained_path=pretrained_path
+        )
         if n_init == 0:
             print(
-                "Warning: no vocabulary overlap with --pretrained; training uses random init only.",
+                f"Warning: no vocabulary overlap with {pretrained_path}; training uses random init only.",
                 flush=True,
             )
         else:
-            print(f"Initialized {n_init} token rows from {args.pretrained}", flush=True)
+            print(f"Initialized {n_init} token rows from {pretrained_path}", flush=True)
 
     opt = torch.optim.SGD(model.parameters(), lr=args.lr)
 
-    total_steps = args.epochs * num_batches
+    total_steps = epochs * num_batches
     arch_label = args.architecture.upper()
-    desc = f"Word2Vec {arch_label} [{device.type.upper()}]  dim={args.dim}"
+    extra = f" {desc_suffix}" if desc_suffix else ""
+    desc = f"Word2Vec {arch_label}{extra} [{device.type.upper()}]  dim={args.dim}"
 
     pbar = tqdm(
         total=total_steps,
@@ -382,7 +364,7 @@ def main() -> None:
         postfix="",
     )
 
-    for epoch in range(args.epochs):
+    for epoch in range(epochs):
         ep_rng = random.Random(seed_base + epoch * 1_000_003)
         if args.architecture == "skipgram":
             batches = batch_pairs(idx_sentences, args.window, args.batch_size, ep_rng)
@@ -418,22 +400,21 @@ def main() -> None:
             epoch_loss += loss_val
             pbar.set_postfix(
                 loss=f"{loss_val:.4f}",
-                epoch=f"{epoch + 1}/{args.epochs}",
+                epoch=f"{epoch + 1}/{epochs}",
                 refresh=False,
             )
             pbar.update(1)
 
         avg = epoch_loss / max(num_batches, 1)
-        tqdm.write(f"  ● epoch {epoch + 1}/{args.epochs}  mean loss: {avg:.6f}")
+        tqdm.write(f"  ● epoch {epoch + 1}/{epochs}  mean loss: {avg:.6f}")
 
     pbar.close()
 
-    # Final vectors: average input + output (common practice; similar to gensim syn0+syn1neg)
     with torch.no_grad():
         emb = (model.in_embed.weight + model.out_embed.weight) * 0.5
         emb_cpu = emb.cpu()
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "embeddings": emb_cpu,
@@ -442,13 +423,166 @@ def main() -> None:
             "dim": args.dim,
             "architecture": args.architecture,
             "window": args.window,
-            "epochs": args.epochs,
+            "epochs": epochs,
             "device_trained": str(device),
-            "pretrained_from": str(args.pretrained) if args.pretrained else None,
+            "pretrained_from": str(pretrained_path) if pretrained_path else None,
+            "trainer": "train_word2vec_torch",
         },
-        args.output,
+        output_path,
     )
-    print(f"Saved checkpoint to {args.output}  (vocab={vocab_size}, dim={args.dim})")
+    print(f"Saved checkpoint to {output_path}  (vocab={vocab_size}, dim={args.dim})")
+
+
+def run_rdf2vec_torch(args: argparse.Namespace) -> None:
+    """Two-stage PyTorch RDF2Vec: pretrain on P1/P2 walks, finetune on instance walks."""
+    mode = args.mode
+    assert mode in ("p1", "p2")
+
+    if args.pretrain_walks is None:
+        args.pretrain_walks = Path("walks_p1.txt") if mode == "p1" else Path("walks_p2.txt")
+
+    out_dir = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    proto_ckpt = out_dir / "word2vec_proto.pt"
+    final_path = args.output
+    if not final_path.is_absolute():
+        final_path = out_dir / final_path
+
+    if not args.pretrain_walks.is_file():
+        raise SystemExit(f"Pretrain walks not found: {args.pretrain_walks}")
+
+    print(f"Stage 1 (protograph): training on {args.pretrain_walks} ...")
+    train_torch_on_walks(
+        args.pretrain_walks,
+        proto_ckpt,
+        args,
+        epochs=args.pretrain_epochs,
+        pretrained_path=None,
+        desc_suffix="[proto]",
+    )
+
+    instance_path = args.instance_walks
+    if instance_path is None:
+        raise SystemExit(
+            "Instance walks required for --mode p1/p2: pass positional <walks> or --instance-walks."
+        )
+    if not instance_path.is_file():
+        raise SystemExit(f"Instance walks not found: {instance_path}")
+
+    n_inst = count_lines(instance_path)
+    print(f"Stage 2 (instance): continuing on {instance_path} ({n_inst} lines) ...")
+    train_torch_on_walks(
+        instance_path,
+        final_path,
+        args,
+        epochs=args.finetune_epochs,
+        pretrained_path=proto_ckpt,
+        desc_suffix="[instance]",
+    )
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Train Word2Vec from walks (PyTorch): single corpus or RDF2Vec P1/P2 two-stage.",
+    )
+    p.add_argument(
+        "--mode",
+        choices=("none", "p1", "p2"),
+        default="none",
+        help="none: one walks file. p1/p2: pretrain on protograph walks then finetune on instance walks.",
+    )
+    p.add_argument(
+        "walks",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="Walks file: required for --mode none; for p1/p2, instance walks unless --instance-walks is set.",
+    )
+    p.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Output .pt (default: word2vec.pt, or rdf2vec_final.pt under --out-dir for p1/p2)",
+    )
+    p.add_argument(
+        "--architecture",
+        "--arch",
+        dest="architecture",
+        choices=("skipgram", "cbow"),
+        default="skipgram",
+        help="Word2Vec variant: skip-gram (center predicts context) or CBOW (context predicts center)",
+    )
+    p.add_argument(
+        "--pretrained",
+        type=Path,
+        default=None,
+        help="(--mode none) Initialize embeddings from a .pt checkpoint (overlapping vocab only)",
+    )
+    p.add_argument("--dim", type=int, default=128, help="Embedding dimension")
+    p.add_argument("--window", type=int, default=5, help="Context window size (each side)")
+    p.add_argument("--epochs", type=int, default=5, help="Training epochs (--mode none)")
+    p.add_argument("--batch-size", type=int, default=4096, help="Batch size (pairs per step)")
+    p.add_argument("--negative", type=int, default=5, help="Number of negative samples per pair")
+    p.add_argument("--min-count", type=int, default=1, help="Ignore tokens with count below this")
+    p.add_argument("--lr", type=float, default=0.025, help="Learning rate")
+    p.add_argument("--seed", type=int, default=None, help="Random seed")
+    p.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+        help="Device: auto picks CUDA, then MPS, then CPU",
+    )
+
+    p.add_argument(
+        "--pretrain-walks",
+        type=Path,
+        default=None,
+        help="Stage-1 walks for --mode p1/p2 (default: walks_p1.txt / walks_p2.txt)",
+    )
+    p.add_argument(
+        "--instance-walks",
+        type=Path,
+        default=None,
+        help="Stage-2 instance walks file (required for p1/p2 unless set via positional walks).",
+    )
+    p.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("."),
+        help="Output directory for --mode p1/p2 (proto checkpoint and final .pt).",
+    )
+    p.add_argument("--pretrain-epochs", type=int, default=5)
+    p.add_argument("--finetune-epochs", type=int, default=5)
+
+    args = p.parse_args()
+
+    if args.mode == "none":
+        if args.walks is None:
+            raise SystemExit("Walks file required when --mode is none.")
+        args.output = args.output or Path("word2vec.pt")
+        pre = args.pretrained
+        if pre is not None and not pre.is_file():
+            raise SystemExit(f"--pretrained not found: {pre}")
+        train_torch_on_walks(
+            args.walks,
+            args.output,
+            args,
+            epochs=args.epochs,
+            pretrained_path=pre,
+            desc_suffix="",
+        )
+        return
+
+    if args.walks is not None:
+        args.instance_walks = args.instance_walks or args.walks
+    if args.instance_walks is None:
+        raise SystemExit(
+            "Instance walks required for --mode p1/p2: pass positional <walks> or --instance-walks."
+        )
+    args.output = args.output or Path("rdf2vec_final.pt")
+    run_rdf2vec_torch(args)
 
 
 if __name__ == "__main__":

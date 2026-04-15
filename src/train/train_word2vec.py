@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Train Word2Vec from a walks file using Gensim (fast CPU implementation).
+Train Word2Vec with Gensim (fast CPU implementation).
 
-Input format matches train_word2vec.py: one space-separated walk per line.
+Modes (--mode):
+  none — Train on a single walks file (default).
+  p1, p2 — Two-stage RDF2Vec: pretrain on protograph P1 or P2 walks, then finetune on
+           instance walks from a file you supply (MASCHInE-style init when an ontology is available).
 
-Logs per-epoch training loss, writes a CSV of losses, saves a loss plot, and shows
-a tqdm progress bar over epochs. Optional per-step loss CSV/plot (--loss-every-steps) logs
-cumulative loss every N training batches (Gensim jobs); requires a single worker.
-Optional Gensim logger progress (within-epoch) can be enabled with --gensim-log-progress.
+Input: one space-separated walk per line.
 
+Single-corpus mode logs per-epoch loss, CSV, PNG, optional per-step loss (--loss-every-steps).
+p1/p2 mode writes pretrain_per_epoch.png and protograph_per_epoch.png; per-step PNGs use
+--loss-every-steps-pretrain / --loss-every-steps-finetune (or --loss-every-steps N for both).
 Saves a .pt checkpoint compatible with evaluate_embeddings.py (embeddings + word2idx).
 """
 
@@ -25,24 +28,36 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from gensim.models import Word2Vec
 from gensim.models.callbacks import CallbackAny2Vec
 from gensim.models.word2vec import LineSentence
 from tqdm.auto import tqdm
 
+from src.protograph.maschine_init import apply_maschine_initialization
+
+
+def _workers_effective(workers: int) -> int:
+    return workers if workers > 0 else (os.cpu_count() or 1)
+
 
 class Word2VecWithStepLoss(Word2Vec):
-    """Hooks Gensim's per-job training to log loss every ``step_loss_interval`` batches.
+    """Hooks Gensim's per-job training to log loss on a step grid.
 
     A "step" is one :meth:`~gensim.models.word2vec.Word2Vec._do_train_job` call (a chunk
     of sentences up to ``batch_words``). This must run with ``workers=1`` so jobs are
     sequential and ``running_training_loss`` matches each batch.
+
+    Samples are recorded at the **first** job, every ``step_loss_interval`` jobs thereafter,
+    plus one :class:`StepLossEndFlush` callback appends the **final** job if it was not
+    already sampled (so short runs still get a usable curve).
     """
 
-    def __init__(self, *args, step_loss_interval: int = 0, **kwargs) -> None:
+    def __init__(self, *args, step_loss_interval: int = 0, step_loss_quiet: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.step_loss_interval = step_loss_interval
+        self.step_loss_quiet = step_loss_quiet
         self.train_epoch_idx: int = 0
         self.step_loss_rows: list[tuple[int, int, float, float]] = []
         self._job_step: int = 0
@@ -54,7 +69,9 @@ class Word2VecWithStepLoss(Word2Vec):
             return tally, raw_tally
         self._job_step += 1
         cum = float(self.running_training_loss)
-        if self._job_step % self.step_loss_interval == 0:
+        n = self.step_loss_interval
+        log_this = self._job_step == 1 or (self._job_step % n == 0)
+        if log_this:
             interval = cum - self._cum_at_last_interval
             self.step_loss_rows.append(
                 (
@@ -64,13 +81,38 @@ class Word2VecWithStepLoss(Word2Vec):
                     interval,
                 )
             )
-            tqdm.write(
-                f"[step loss] step={self._job_step} epoch={self.train_epoch_idx} "
-                f"cumulative={cum:.6f} interval={interval:.6f}",
-                file=sys.stdout,
-            )
+            if not self.step_loss_quiet:
+                tqdm.write(
+                    f"[step loss] step={self._job_step} epoch={self.train_epoch_idx} "
+                    f"cumulative={cum:.6f} interval={interval:.6f}",
+                    file=sys.stdout,
+                )
             self._cum_at_last_interval = cum
         return tally, raw_tally
+
+
+class StepLossEndFlush(CallbackAny2Vec):
+    """Append one step-loss sample at the last training job if it was not already logged."""
+
+    def on_train_end(self, model: Word2Vec) -> None:
+        if not isinstance(model, Word2VecWithStepLoss):
+            return
+        m = model
+        if m.step_loss_interval <= 0 or m._job_step == 0:
+            return
+        last_logged = m.step_loss_rows[-1][0] if m.step_loss_rows else 0
+        if last_logged == m._job_step:
+            return
+        cum = float(model.get_latest_training_loss())
+        interval = cum - m._cum_at_last_interval
+        m.step_loss_rows.append((m._job_step, m.train_epoch_idx, cum, interval))
+        if not m.step_loss_quiet:
+            tqdm.write(
+                f"[step loss] step={m._job_step} epoch={m.train_epoch_idx} "
+                f"cumulative={cum:.6f} interval={interval:.6f} (end flush)",
+                file=sys.stdout,
+            )
+        m._cum_at_last_interval = cum
 
 
 class EpochTagCallback(CallbackAny2Vec):
@@ -88,9 +130,10 @@ class EpochTagCallback(CallbackAny2Vec):
 class EpochLossProgress(CallbackAny2Vec):
     """Per-epoch loss (from cumulative training loss) and tqdm over epochs."""
 
-    def __init__(self, total_epochs: int, desc: str) -> None:
+    def __init__(self, total_epochs: int, desc: str, *, echo: bool = False) -> None:
         self.total_epochs = total_epochs
         self.desc = desc
+        self.echo = echo
         self.prev_cumulative = 0.0
         self.epoch_losses: list[float] = []
         self._pbar: tqdm | None = None
@@ -113,6 +156,12 @@ class EpochLossProgress(CallbackAny2Vec):
         if self._pbar is not None:
             self._pbar.set_postfix(loss=f"{epoch_loss:.4f}", refresh=False)
             self._pbar.update(1)
+        if self.echo:
+            tqdm.write(
+                f"[{self.desc}] epoch {len(self.epoch_losses)}/{self.total_epochs} "
+                f"loss={epoch_loss:.6f}",
+                file=sys.stdout,
+            )
 
     def on_train_end(self, model: Word2Vec) -> None:
         if self._pbar is not None:
@@ -138,42 +187,57 @@ def save_loss_csv(path: Path, losses: list[float]) -> None:
             w.writerow([i, f"{loss:.8f}"])
 
 
-def plot_losses(path: Path, losses: list[float]) -> None:
+def _plot_loss_per_epoch(
+    path: Path,
+    losses: list[float],
+    *,
+    title: str,
+    suptitle: str | None = None,
+) -> None:
+    if not losses:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     epochs = range(1, len(losses) + 1)
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.plot(list(epochs), losses, marker="o", markersize=3)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Training loss")
-    ax.set_title("Gensim Word2Vec — loss per epoch")
+    ax.set_title(title)
     ax.grid(True, alpha=0.3)
+    if suptitle:
+        fig.suptitle(suptitle, y=1.02)
     fig.tight_layout()
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_step_losses(
+def _plot_loss_per_step(
     path: Path,
     rows: list[tuple[int, int, float, float]],
+    *,
+    title: str,
 ) -> None:
-    """Plot cumulative and interval loss vs training batch step (two panels)."""
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     steps = [r[0] for r in rows]
     cumulative = [r[2] for r in rows]
     interval = [r[3] for r in rows]
+    smax = max(steps)
+    x_right = max(smax * 1.02, smax + 1.0)
     fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
     ax0.plot(steps, cumulative, marker="o", markersize=2)
     ax0.set_ylabel("Cumulative loss")
-    ax0.set_title("Gensim Word2Vec — loss vs training batch step")
+    ax0.set_title(title)
     ax0.grid(True, alpha=0.3)
+    ax0.set_xlim(0.0, x_right)
     ax1.plot(steps, interval, marker="o", markersize=2, color="C1")
     ax1.set_xlabel("Step (batch index)")
     ax1.set_ylabel("Interval loss")
     ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(0.0, x_right)
     fig.tight_layout()
-    fig.savefig(path, dpi=150)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -196,94 +260,310 @@ def build_gensim_to_pt(model: Word2Vec) -> dict:
     }
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(
-        description="Train Word2Vec with Gensim (walks file → .pt + loss log/plot).",
-    )
-    p.add_argument("walks", type=Path, help="Walks file: one space-separated walk per line")
-    p.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        default=Path("word2vec_gensim.pt"),
-        help="Output .pt checkpoint (embeddings + word2idx)",
-    )
-    p.add_argument(
-        "--architecture",
-        "--arch",
-        dest="architecture",
-        choices=("skipgram", "cbow"),
-        default="skipgram",
-        help="sg=1 skip-gram, sg=0 CBOW",
-    )
-    p.add_argument("--dim", type=int, default=128, help="Vector size (vector_size)")
-    p.add_argument("--window", type=int, default=5, help="Context window")
-    p.add_argument("--epochs", type=int, default=5, help="Training epochs")
-    p.add_argument("--negative", type=int, default=5, help="Negative samples")
-    p.add_argument("--min-count", type=int, default=1, help="Ignore tokens below this count")
-    p.add_argument("--lr", type=float, default=0.025, help="Initial learning rate (alpha)")
-    p.add_argument(
-        "--min-alpha",
-        type=float,
-        default=0.0001,
-        help="Minimum learning rate after linear decay (min_alpha)",
-    )
-    p.add_argument(
-        "--workers",
-        type=int,
-        default=0,
-        help="Worker threads (0 = use all available cores)",
-    )
-    p.add_argument("--seed", type=int, default=None, help="Random seed")
-    p.add_argument(
-        "--loss-log",
-        type=Path,
-        default=None,
-        help="CSV path for per-epoch losses (default: <output stem>_loss.csv)",
-    )
-    p.add_argument(
-        "--loss-plot",
-        type=Path,
-        default=None,
-        help="PNG path for loss curve (default: <output stem>_loss.png)",
-    )
-    p.add_argument(
-        "--no-plot",
-        action="store_true",
-        help="Do not write loss PNGs (epoch curve or step curve)",
-    )
-    p.add_argument(
-        "--gensim-log-progress",
-        action="store_true",
-        help="Enable Gensim INFO logging (within-epoch progress lines; can be noisy)",
-    )
-    p.add_argument(
-        "--report-delay",
-        type=float,
-        default=1.0,
-        help="Seconds between Gensim progress log lines (only with --gensim-log-progress)",
-    )
-    p.add_argument(
-        "--loss-every-steps",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Log cumulative loss every N training batches (Gensim jobs); implies --workers 1",
-    )
-    p.add_argument(
-        "--loss-steps-log",
-        type=Path,
-        default=None,
-        help="CSV for step losses (default: <output stem>_loss_steps.csv when --loss-every-steps > 0)",
-    )
-    p.add_argument(
-        "--loss-steps-plot",
-        type=Path,
-        default=None,
-        help="PNG for step loss curves (default: <output stem>_loss_steps.png when --loss-every-steps > 0)",
-    )
-    args = p.parse_args()
+def count_lines(path: Path) -> int:
+    with path.open(encoding="utf-8") as f:
+        return sum(1 for _ in f)
 
+
+def train_word2vec_stage(
+    walks_path: Path,
+    *,
+    vector_size: int,
+    window: int,
+    min_count: int,
+    workers: int,
+    sg: int,
+    negative: int,
+    epochs: int,
+    seed: int | None,
+    alpha: float,
+    min_alpha: float,
+    desc: str,
+    step_loss_interval: int = 0,
+    step_loss_quiet: bool = False,
+) -> tuple[Word2Vec, list[float]]:
+    """Train Word2Vec with per-epoch loss; optional per-batch step loss (``workers`` must be 1)."""
+    sentences = LineSentence(str(walks_path))
+    kw = dict(
+        vector_size=vector_size,
+        window=window,
+        min_count=min_count,
+        workers=workers,
+        sg=sg,
+        hs=0,
+        negative=negative,
+        alpha=alpha,
+        min_alpha=min_alpha,
+        seed=seed,
+        epochs=epochs,
+    )
+    model = Word2VecWithStepLoss(
+        step_loss_interval=step_loss_interval,
+        step_loss_quiet=step_loss_quiet,
+        **kw,
+    )
+    model.build_vocab(sentences)
+    cb = EpochLossProgress(total_epochs=epochs, desc=desc)
+    callbacks: list[CallbackAny2Vec] = [cb]
+    if step_loss_interval > 0:
+        assert isinstance(model, Word2VecWithStepLoss)
+        callbacks.insert(0, EpochTagCallback(model))
+        callbacks.append(StepLossEndFlush())
+    model.train(
+        corpus_iterable=sentences,
+        total_examples=model.corpus_count,
+        epochs=epochs,
+        compute_loss=True,
+        callbacks=callbacks,
+    )
+    return model, cb.epoch_losses
+
+
+def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
+    """Pretrain on P1 or P2 protograph walks, then finetune on instance walks (``--mode p1`` / ``p2``)."""
+    mode = args.mode
+    assert mode in ("p1", "p2")
+
+    if args.pretrain_walks is None:
+        args.pretrain_walks = Path("walks_p1.txt") if mode == "p1" else Path("walks_p2.txt")
+
+    out_dir = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.loss_every_steps > 0:
+        pretrain_loss_every = args.loss_every_steps
+        finetune_loss_every = args.loss_every_steps
+    else:
+        pretrain_loss_every = args.loss_every_steps_pretrain
+        finetune_loss_every = args.loss_every_steps_finetune
+
+    any_step_loss = pretrain_loss_every > 0 or finetune_loss_every > 0
+    if not any_step_loss and not args.no_loss_plots:
+        print(
+            "Note: per-step loss PNGs are disabled (use --loss-every-steps-pretrain / "
+            "--loss-every-steps-finetune, or --loss-every-steps N for both; implies workers=1).",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    pretrained_path = out_dir / "rdf2vec_pretrained.model"
+    final_pt_path = args.output
+    if not final_pt_path.is_absolute():
+        final_pt_path = out_dir / final_pt_path
+
+    sg = 1 if args.architecture == "skipgram" else 0
+    pretrain_losses: list[float] | None = None
+    pretrain_step_rows: list[tuple[int, int, float, float]] = []
+
+    if not args.skip_pretrain:
+        if not args.pretrain_walks.is_file():
+            raise SystemExit(f"Pretrain walks not found: {args.pretrain_walks}")
+        print(f"Stage 1: training Word2Vec on {args.pretrain_walks} ...")
+        st_interval = 0
+        st_quiet = False
+        if pretrain_loss_every > 0:
+            st_interval = pretrain_loss_every
+            st_quiet = True
+            pre_workers = 1
+            if args.workers > 1:
+                print(
+                    "Note: step loss logging requires a single worker during stage 1; using workers=1.",
+                    flush=True,
+                )
+        else:
+            pre_workers = _workers_effective(args.workers)
+        pre_model, pretrain_losses = train_word2vec_stage(
+            args.pretrain_walks,
+            vector_size=args.dim,
+            window=args.window,
+            min_count=args.min_count,
+            workers=pre_workers,
+            sg=sg,
+            negative=args.negative,
+            epochs=args.pretrain_epochs,
+            seed=args.seed,
+            alpha=args.lr,
+            min_alpha=args.min_alpha,
+            desc="Stage 1 pretrain",
+            step_loss_interval=st_interval,
+            step_loss_quiet=st_quiet,
+        )
+        if isinstance(pre_model, Word2VecWithStepLoss) and pretrain_loss_every > 0:
+            pretrain_step_rows = list(pre_model.step_loss_rows)
+        pre_model.save(str(pretrained_path))
+        print(f"Wrote {pretrained_path} (vocab size {len(pre_model.wv)})")
+    else:
+        if not pretrained_path.is_file():
+            raise SystemExit(f"--skip-pretrain but missing {pretrained_path}")
+        pre_model = Word2Vec.load(str(pretrained_path))
+        print(f"Loaded {pretrained_path} (vocab size {len(pre_model.wv)})")
+
+    instance_path = args.instance_walks
+    if instance_path is None:
+        raise SystemExit(
+            "Instance walks required for --mode p1/p2: pass positional <walks> or --instance-walks."
+        )
+    if not instance_path.is_file():
+        raise SystemExit(f"Instance walks not found: {instance_path}")
+
+    n_inst = count_lines(instance_path)
+    print(f"Stage 2: continuing training on {instance_path} ({n_inst} lines) ...")
+
+    ontology_path = args.ontology
+    if ontology_path is None:
+        cand = instance_path.parent / "ontology.nt"
+        if cand.is_file():
+            ontology_path = cand
+
+    stage1_vectors = {
+        w: np.asarray(pre_model.wv[w], dtype=np.float32).copy() for w in pre_model.wv.index_to_key
+    }
+    pre_model.build_vocab(LineSentence(str(instance_path)), update=True)
+
+    if args.maschine_init and ontology_path is not None and ontology_path.is_file():
+        n_ent, n_rel, n_rand = apply_maschine_initialization(
+            pre_model,
+            stage1_vectors,
+            ontology_path,
+        )
+        print(
+            f"MASCHInE init: entity rows from class vectors={n_ent}, "
+            f"relation rows copied from pretrain={n_rel}, left random={n_rand}"
+        )
+    elif args.maschine_init and (ontology_path is None or not ontology_path.is_file()):
+        print(
+            "MASCHInE init skipped (no ontology.nt); pass --ontology or place ontology.nt beside instance walks"
+        )
+
+    if finetune_loss_every > 0 and args.workers > 1:
+        print(
+            "Note: step loss logging requires a single worker during stage 2; using workers=1.",
+            flush=True,
+        )
+    ft_workers = 1 if finetune_loss_every > 0 else _workers_effective(args.workers)
+    pre_model.workers = ft_workers
+
+    ft_loss_cb = EpochLossProgress(
+        total_epochs=args.finetune_epochs,
+        desc="Stage 2 finetune",
+    )
+    ft_callbacks: list[CallbackAny2Vec] = [ft_loss_cb]
+    step_model_ok = isinstance(pre_model, Word2VecWithStepLoss)
+    if finetune_loss_every > 0 and not step_model_ok:
+        print(
+            "Warning: step-loss plots need a model saved from this script's pretrain "
+            "(Word2VecWithStepLoss). Skipping per-step plots; epoch plot still saved.",
+            file=sys.stderr,
+        )
+    if finetune_loss_every > 0 and step_model_ok:
+        assert isinstance(pre_model, Word2VecWithStepLoss)
+        pre_model.step_loss_interval = finetune_loss_every
+        pre_model.step_loss_quiet = False
+        pre_model.step_loss_rows.clear()
+        pre_model._job_step = 0
+        pre_model._cum_at_last_interval = 0.0
+        pre_model.train_epoch_idx = 0
+        ft_callbacks.insert(0, EpochTagCallback(pre_model))
+        ft_callbacks.append(StepLossEndFlush())
+    elif isinstance(pre_model, Word2VecWithStepLoss):
+        pre_model.step_loss_interval = 0
+
+    pre_model.train(
+        corpus_iterable=LineSentence(str(instance_path)),
+        total_examples=n_inst,
+        epochs=args.finetune_epochs,
+        compute_loss=True,
+        callbacks=ft_callbacks,
+    )
+    finetune_losses = ft_loss_cb.epoch_losses
+
+    if not args.no_loss_plots:
+        pre_ep = (
+            args.loss_pretrain_epoch_plot
+            if args.loss_pretrain_epoch_plot is not None
+            else out_dir / "pretrain_per_epoch.png"
+        )
+        proto_ep = (
+            args.loss_protograph_epoch_plot
+            if args.loss_protograph_epoch_plot is not None
+            else out_dir / "finetune_per_epoch.png"
+        )
+        pre_st = (
+            args.loss_pretrain_steps_plot
+            if args.loss_pretrain_steps_plot is not None
+            else out_dir / "pretrain_per_step.png"
+        )
+        proto_st = (
+            args.loss_steps_plot if args.loss_steps_plot is not None else out_dir / "finetune_per_step.png"
+        )
+
+        if not args.skip_pretrain and pretrain_losses and len(pretrain_losses) > 0:
+            _plot_loss_per_epoch(
+                pre_ep,
+                pretrain_losses,
+                title="Stage 1 — pretrain (protograph walks)",
+                suptitle="RDF2Vec — pretrain loss per epoch",
+            )
+            print(f"Wrote pretrain per-epoch loss plot: {pre_ep}")
+        elif not args.skip_pretrain:
+            print("No pretrain epoch losses to plot.", file=sys.stderr)
+
+        if finetune_losses:
+            _plot_loss_per_epoch(
+                proto_ep,
+                finetune_losses,
+                title="Stage 2 — finetune (instance walks)",
+                suptitle="RDF2Vec — protograph loss per epoch",
+            )
+            print(f"Wrote protograph per-epoch loss plot: {proto_ep}")
+        else:
+            print("No finetune epoch losses to plot.", file=sys.stderr)
+
+        if not args.skip_pretrain and pretrain_loss_every > 0:
+            if pretrain_step_rows:
+                _plot_loss_per_step(
+                    pre_st,
+                    pretrain_step_rows,
+                    title="Stage 1 — pretrain (protograph walks) — loss vs batch step",
+                )
+                print(
+                    f"Wrote pretrain per-step loss plot (every {pretrain_loss_every} batches): {pre_st}",
+                )
+            else:
+                print(
+                    "No stage-1 step-loss points to plot "
+                    "(try a smaller --loss-every-steps-pretrain).",
+                    file=sys.stderr,
+                )
+
+        if finetune_loss_every > 0 and step_model_ok:
+            assert isinstance(pre_model, Word2VecWithStepLoss)
+            if pre_model.step_loss_rows:
+                _plot_loss_per_step(
+                    proto_st,
+                    pre_model.step_loss_rows,
+                    title="Stage 2 — finetune (instance walks) — loss vs batch step",
+                )
+                print(
+                    f"Wrote protograph per-step loss plot (every {finetune_loss_every} batches): {proto_st}",
+                )
+            else:
+                print(
+                    "No stage-2 step-loss points to plot (try a smaller --loss-every-steps-finetune).",
+                    file=sys.stderr,
+                )
+
+    ckpt = build_gensim_to_pt(pre_model)
+    ckpt["trainer"] = "rdf2vec_train"
+    final_pt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(ckpt, final_pt_path)
+    print(f"Wrote {final_pt_path} (vocab size {len(pre_model.wv)})")
+
+
+def run_single_corpus_mode(args: argparse.Namespace) -> None:
+    """Train on ``args.walks`` (``--mode none``)."""
+    if args.walks is None:
+        raise SystemExit("Walks file required when --mode is none.")
     if not args.walks.is_file():
         raise SystemExit(f"Walks file not found: {args.walks}")
 
@@ -335,6 +615,7 @@ def main() -> None:
     if args.loss_every_steps > 0:
         assert isinstance(model, Word2VecWithStepLoss)
         callbacks.insert(0, EpochTagCallback(model))
+        callbacks.append(StepLossEndFlush())
 
     train_kw: dict = {
         "corpus_iterable": sentences,
@@ -378,7 +659,11 @@ def main() -> None:
                 if args.loss_steps_plot is not None
                 else Path(f"{stem}_loss_steps.png")
             )
-            plot_step_losses(steps_plot, model.step_loss_rows)
+            _plot_loss_per_step(
+                steps_plot,
+                model.step_loss_rows,
+                title="Gensim Word2Vec — loss vs training batch step",
+            )
             tqdm.write(f"Wrote step loss plot: {steps_plot}")
         elif not args.no_plot and not model.step_loss_rows:
             tqdm.write(
@@ -387,7 +672,11 @@ def main() -> None:
             )
 
     if not args.no_plot:
-        plot_losses(loss_plot, losses)
+        _plot_loss_per_epoch(
+            loss_plot,
+            losses,
+            title="Gensim Word2Vec — loss per epoch",
+        )
         tqdm.write(f"Wrote loss plot: {loss_plot}")
 
     ckpt = build_gensim_to_pt(model)
@@ -396,6 +685,215 @@ def main() -> None:
     tqdm.write(
         f"Saved checkpoint to {args.output}  (vocab={len(ckpt['word2idx'])}, dim={args.dim})",
     )
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Train Word2Vec with Gensim: single corpus (--mode none) or RDF2Vec P1/P2 two-stage.",
+    )
+    p.add_argument(
+        "--mode",
+        choices=("none", "p1", "p2"),
+        default="none",
+        help="none: train on one walks file. p1/p2: pretrain on protograph walks then finetune on instance walks.",
+    )
+    p.add_argument(
+        "walks",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="Walks file: required for --mode none; for p1/p2, instance walks unless --instance-walks is set.",
+    )
+    p.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Output .pt checkpoint (default: word2vec_gensim.pt or rdf2vec_final.pt in --out-dir)",
+    )
+    p.add_argument(
+        "--architecture",
+        "--arch",
+        dest="architecture",
+        choices=("skipgram", "cbow"),
+        default="skipgram",
+        help="sg=1 skip-gram, sg=0 CBOW",
+    )
+    p.add_argument("--dim", type=int, default=128, help="Vector size (vector_size)")
+    p.add_argument("--window", type=int, default=5, help="Context window")
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=5,
+        help="Training epochs (only --mode none; for p1/p2 use --pretrain-epochs / --finetune-epochs)",
+    )
+    p.add_argument("--negative", type=int, default=5, help="Negative samples")
+    p.add_argument("--min-count", type=int, default=1, help="Ignore tokens below this count")
+    p.add_argument("--lr", type=float, default=0.025, help="Initial learning rate (alpha)")
+    p.add_argument(
+        "--min-alpha",
+        type=float,
+        default=0.0001,
+        help="Minimum learning rate after linear decay (min_alpha)",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Gensim worker threads (0 = all cores; single-corpus mode). For --mode p1/p2, stage 1/2 training.",
+    )
+    p.add_argument("--seed", type=int, default=None, help="Random seed")
+    p.add_argument(
+        "--loss-log",
+        type=Path,
+        default=None,
+        help="CSV path for per-epoch losses (default: <output stem>_loss.csv)",
+    )
+    p.add_argument(
+        "--loss-plot",
+        type=Path,
+        default=None,
+        help="PNG path for loss curve (default: <output stem>_loss.png)",
+    )
+    p.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Do not write loss PNGs (epoch curve or step curve)",
+    )
+    p.add_argument(
+        "--gensim-log-progress",
+        action="store_true",
+        help="Enable Gensim INFO logging (within-epoch progress lines; can be noisy)",
+    )
+    p.add_argument(
+        "--report-delay",
+        type=float,
+        default=1.0,
+        help="Seconds between Gensim progress log lines (only with --gensim-log-progress)",
+    )
+    p.add_argument(
+        "--loss-every-steps",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Per-batch step loss: CSV/PNG in --mode none. For p1/p2, if N>0, sets both "
+        "--loss-every-steps-pretrain and --loss-every-steps-finetune to N; if 0, use those flags separately.",
+    )
+    p.add_argument(
+        "--loss-every-steps-pretrain",
+        type=int,
+        default=1,
+        metavar="N",
+        help="p1/p2 stage 1: log step loss every N batch jobs (default 1; use 0 to disable). "
+        "Ignored when --loss-every-steps > 0.",
+    )
+    p.add_argument(
+        "--loss-every-steps-finetune",
+        type=int,
+        default=0,
+        metavar="N",
+        help="p1/p2 stage 2: log step loss every N batch jobs (default 0 = epoch plots only). "
+        "Ignored when --loss-every-steps > 0.",
+    )
+    p.add_argument(
+        "--loss-steps-log",
+        type=Path,
+        default=None,
+        help="CSV for step losses (default: <output stem>_loss_steps.csv when --loss-every-steps > 0)",
+    )
+    p.add_argument(
+        "--loss-steps-plot",
+        type=Path,
+        default=None,
+        help="PNG for step loss curves (default: <output stem>_loss_steps.png when --loss-every-steps > 0)",
+    )
+
+    # RDF2Vec (--mode p1 / p2)
+    p.add_argument(
+        "--pretrain-walks",
+        type=Path,
+        default=None,
+        help="Stage-1 walks (default: walks_p1.txt for p1, walks_p2.txt for p2).",
+    )
+    p.add_argument(
+        "--instance-walks",
+        type=Path,
+        default=None,
+        help="Stage-2 instance walks file (required for p1/p2 unless set via positional walks).",
+    )
+    p.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("."),
+        help="Directory for models and walk files for --mode p1/p2 (default: current directory).",
+    )
+    p.add_argument("--pretrain-epochs", type=int, default=5)
+    p.add_argument("--finetune-epochs", type=int, default=5)
+    p.add_argument(
+        "--skip-pretrain",
+        action="store_true",
+        help="Load existing pretrained model from --out-dir instead of training stage 1.",
+    )
+    p.add_argument(
+        "--ontology",
+        type=Path,
+        default=None,
+        help="N-Triples ontology with rdf:type and rdfs:subClassOf. "
+        "If omitted, uses <instance-walks-dir>/ontology.nt when present.",
+    )
+    p.add_argument(
+        "--maschine-init",
+        dest="maschine_init",
+        action="store_true",
+        default=True,
+        help="MASCHInE initialization for new instance tokens (default: on when ontology is available).",
+    )
+    p.add_argument(
+        "--no-maschine-init",
+        dest="maschine_init",
+        action="store_false",
+        help="Skip MASCHInE init; keep gensim random init for new vocabulary after build_vocab(update=True).",
+    )
+    p.add_argument(
+        "--loss-pretrain-epoch-plot",
+        type=Path,
+        default=None,
+        help="PNG for stage-1 pretrain per-epoch loss (default: <out-dir>/pretrain_per_epoch.png).",
+    )
+    p.add_argument(
+        "--loss-protograph-epoch-plot",
+        type=Path,
+        default=None,
+        help="PNG for stage-2 instance finetune per-epoch loss (default: <out-dir>/finetune_per_epoch.png).",
+    )
+    p.add_argument(
+        "--loss-pretrain-steps-plot",
+        type=Path,
+        default=None,
+        help="PNG for stage-1 pretrain per-step loss (default: <out-dir>/pretrain_per_step.png).",
+    )
+    p.add_argument(
+        "--no-loss-plots",
+        action="store_true",
+        help="Do not write RDF2Vec loss PNGs.",
+    )
+
+    args = p.parse_args()
+
+    if args.mode == "none":
+        args.output = args.output or Path("word2vec_gensim.pt")
+        run_single_corpus_mode(args)
+        return
+
+    # p1 / p2
+    if args.walks is not None:
+        args.instance_walks = args.instance_walks or args.walks
+    if args.instance_walks is None:
+        raise SystemExit(
+            "Instance walks required for --mode p1/p2: pass positional <walks> or --instance-walks."
+        )
+    args.output = args.output or Path("rdf2vec_final.pt")
+    run_rdf2vec_two_stage(args)
 
 
 if __name__ == "__main__":

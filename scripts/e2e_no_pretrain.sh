@@ -4,9 +4,11 @@
 
 set -euo pipefail
 
-# Experiment folder under output/ — edit the default, or run: OUTPUT_DIR=my_run ./scripts/e2e.sh
+# Test case id (folder under v1/synthetic_ontology/<TC>/...). Override: TC=tc02 ./scripts/e2e_no_pretrain.sh
+TC="${TC:-tc11}"
+# Experiment folder under output/ — edit the default, or run: OUTPUT_DIR=my_run ./scripts/e2e_no_pretrain.sh
 # Each run uses a new YYYYMMDD_HHMMSS subfolder so repeated runs do not overwrite previous outputs.
-OUTPUT_DIR="${OUTPUT_DIR:-tc02_rdf2vec}"
+OUTPUT_DIR="${OUTPUT_DIR:-${TC}_rdf2vec}"
 RUN_DATETIME="$(date +%Y%m%d_%H%M%S)"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,8 +19,9 @@ OUT="${REPO_ROOT}/output/${OUTPUT_DIR}/${RUN_DATETIME}"
 mkdir -p "${OUT}"
 
 # Dataset paths (relative to repo root)
-GRAPH_NT="${REPO_ROOT}/v1/synthetic_ontology/tc02/synthetic_ontology/graph.nt"
-TEST_TXT="${REPO_ROOT}/v1/synthetic_ontology/tc02/synthetic_ontology/1000/train_test/test.txt"
+BASE_ONTO="${REPO_ROOT}/v1/synthetic_ontology/${TC}/synthetic_ontology"
+GRAPH_NT="${BASE_ONTO}/graph.nt"
+TEST_TXT="${BASE_ONTO}/1000/train_test/test.txt"
 
 WALKS_FILE="${OUT}/walks.txt"
 CHECKPOINT="${OUT}/rdf2vec_word2vec.pt"

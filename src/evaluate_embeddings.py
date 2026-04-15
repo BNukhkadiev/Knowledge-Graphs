@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Evaluate a Word2Vec checkpoint (.pt from train_word2vec.py) on a labeled entity file.
+Evaluate embeddings on a labeled entity file (node classification).
+
+Checkpoint: PyTorch ``.pt`` from ``train_word2vec.py`` (``embeddings`` + ``word2idx``),
+or gensim ``KeyedVectors`` ``.kv``. RDF2Vec stage-2 output is ``rdf2vec_final.pt``.
 
 Each line: <entity_id>\\t<label> (tab-separated). Trains a logistic regression on
 train.txt embeddings and reports test metrics with bootstrap standard errors.
@@ -13,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from gensim.models import KeyedVectors
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from tqdm.auto import tqdm
@@ -128,6 +132,25 @@ def default_train_path(test_path: Path) -> Path:
     return test_path.parent / "train.txt"
 
 
+def load_embeddings_checkpoint(path: Path) -> tuple[np.ndarray, dict[str, int]]:
+    """Return (embedding matrix [vocab, dim], token -> row index)."""
+    suffix = path.suffix.lower()
+    if suffix == ".kv":
+        wv = KeyedVectors.load(str(path), mmap="r")
+        emb = np.asarray(wv.vectors, dtype=np.float32)
+        word2idx: dict[str, int] = dict(wv.key_to_index)
+        return emb, word2idx
+
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if "embeddings" not in ckpt or "word2idx" not in ckpt:
+        raise SystemExit("Checkpoint must contain 'embeddings' and 'word2idx', or use a .kv file.")
+    emb_t = ckpt["embeddings"]
+    if emb_t.dim() != 2:
+        raise SystemExit("'embeddings' must be 2D [vocab, dim].")
+    emb = emb_t.detach().cpu().numpy().astype(np.float32, copy=False)
+    return emb, ckpt["word2idx"]
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Evaluate embedding checkpoint on labeled test.txt (node classification)."
@@ -142,7 +165,7 @@ def main() -> None:
         "--checkpoint",
         type=Path,
         required=True,
-        help="word2vec.pt from train_word2vec.py",
+        help="Embeddings: .pt (train_word2vec / rdf2vec_final.pt) or gensim .kv",
     )
     p.add_argument(
         "--train",
@@ -182,15 +205,7 @@ def main() -> None:
     if not args.checkpoint.is_file():
         raise SystemExit(f"Checkpoint not found: {args.checkpoint}")
 
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if "embeddings" not in ckpt or "word2idx" not in ckpt:
-        raise SystemExit("Checkpoint must contain 'embeddings' and 'word2idx'.")
-
-    emb_t = ckpt["embeddings"]
-    if emb_t.dim() != 2:
-        raise SystemExit("'embeddings' must be 2D [vocab, dim].")
-    emb = emb_t.detach().cpu().numpy().astype(np.float32, copy=False)
-    word2idx: dict[str, int] = ckpt["word2idx"]
+    emb, word2idx = load_embeddings_checkpoint(args.checkpoint)
 
     train_tokens, y_train = load_labeled_txt(train_path)
     test_tokens, y_test = load_labeled_txt(args.test)
