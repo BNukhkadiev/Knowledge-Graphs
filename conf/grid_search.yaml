@@ -1,38 +1,32 @@
 # Grid / sweep config for RDF2Vec-style training (Gensim: src/train/train_word2vec.py).
 #
-# Structure:
-#   1) training_mode — no_pretrain | P1 | P2
-#   2) If P1 or P2: pretrain on protograph (walk params + pretrain Word2Vec epochs only)
-#   3) Finetune: instance KG walks + Word2Vec parameters for the instance stage
+# Training recipe (no_pretrain | p1 | p2) is chosen on the CLI:
+#   uv run scripts/run_grid_search.py conf/grid_search.yaml --tc <TC> --training-mode <MODE>
+#
+# Structure (for the chosen mode):
+#   - no_pretrain: finetune.* only (instance walks + Word2Vec --epochs)
+#   - p1 or p2: pretrain on protograph (walk params + pretrain Word2Vec epochs), then finetune.*
 #
 # Sweep driver semantics:
 #   - no_pretrain  → --mode none on instance walks; use finetune.* only (skip pretrain.*)
-#   - P1           → --mode p1: pretrain.walks on P1 protograph .nt → walks_p1.txt, then finetune.*
-#   - P2           → --mode p2: pretrain.walks on P2 protograph .nt → walks_p2.txt, then finetune.*
+#   - p1           → --mode p1: pretrain.walks on P1 protograph .nt → walks_p1.txt, then finetune.*
+#   - p2           → --mode p2: pretrain.walks on P2 protograph .nt → walks_p2.txt, then finetune.*
 #
-# For P1/P2, train_word2vec.py uses the same --dim, --window, --negative, … for both stages;
+# For p1/p2, train_word2vec.py uses the same --dim, --window, --negative, … for both stages;
 # stage-1 learning rate is --pretrain-lr / --pretrain-min-alpha (see pretrain.word2vec); stage 2
 # uses --lr / --min-alpha from finetune.word2vec. Epochs: pretrain.word2vec vs finetune_epochs.
 #
-# Cartesian product of all lists can explode — fix training_mode to one value or trim lists.
+# Cartesian product of all lists can explode — trim lists.
 # Random search: scripts/run_grid_search.py --random-search --limit N samples N configs
-# (one uniform draw per list; training_mode is drawn each trial). Use --random-seed for reproducibility.
+# (one uniform draw per list). Use --random-seed for reproducibility.
 
 # ---------------------------------------------------------------------------
-# 1) Mode (maps to --mode none | p1 | p2)
-# ---------------------------------------------------------------------------
-training_mode:
-  # - no_pretrain
-  # - P1
-  - P2
-
-# ---------------------------------------------------------------------------
-# 2) Pretrain — only when training_mode is P1 or P2
+# 1) Pretrain — only used when --training-mode is p1 or p2
 #
-# 2.1 Walks on the protograph for that variant (src/walk/random_walks.py):
-#       P1: input = P1 protograph .nt  →  e.g. walks_p1.txt
-#       P2: input = P2 protograph .nt  →  e.g. walks_p2.txt
-# 2.2 Word2Vec: --pretrain-epochs, --pretrain-lr (optional: pretrain_min_alpha).
+# 1.1 Walks on the protograph for that variant (src/walk/random_walks.py):
+#       p1: input = P1 protograph .nt  →  e.g. walks_p1.txt
+#       p2: input = P2 protograph .nt  →  e.g. walks_p2.txt
+# 1.2 Word2Vec: --pretrain-epochs, --pretrain-lr (optional: pretrain_min_alpha).
 # ---------------------------------------------------------------------------
 pretrain:
   walks:
@@ -44,7 +38,7 @@ pretrain:
       - 16
     walks_per_entity:
       - 100
-      # - 200
+      - 200
       # - 300
     token_format:
       - angled
@@ -53,7 +47,7 @@ pretrain:
     pretrain_epochs:
       # - 5
       - 10
-      # - 20
+      - 20
     pretrain_lr:
       - 0.01
       - 0.1
@@ -61,13 +55,13 @@ pretrain:
     #   - 0.0001
 
 # ---------------------------------------------------------------------------
-# 3) Finetune — instance knowledge graph
+# 2) Finetune — instance knowledge graph
 #
-# 3.1 Instance graph walks (random_walks.py on instance .nt)
-# 3.2 Word2Vec on instance corpus:
+# 2.1 Instance graph walks (random_walks.py on instance .nt)
+# 2.2 Word2Vec on instance corpus:
 #       no_pretrain     → --epochs from epochs (ignore finetune_epochs)
-#       P1 / P2         → --finetune-epochs from finetune_epochs
-#     Shared knobs (architecture, dim, window, …) apply to the instance stage; for P1/P2 they
+#       p1 / p2         → --finetune-epochs from finetune_epochs
+#     Shared knobs (architecture, dim, window, …) apply to the instance stage; for p1/p2 they
 #     are also used for the pretrain stage with the same CLI.
 # ---------------------------------------------------------------------------
 finetune:
@@ -76,7 +70,7 @@ finetune:
       - jrdf2vec-duplicate-free
     depth:
       - 4
-      # - 8
+      - 8
       # - 16
     walks_per_entity:
       - 100
@@ -91,7 +85,7 @@ finetune:
       - 5
       - 10
 
-    # P1 / P2 (instance finetune): maps to --finetune-epochs
+    # p1 / p2 (instance finetune): maps to --finetune-epochs
     finetune_epochs:
       - 5
       - 10
