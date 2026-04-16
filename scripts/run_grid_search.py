@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Run a hyperparameter grid from conf/grid_search.yaml for a synthetic-ontology test case (TC).
+Run a hyperparameter grid from conf/grid_search.yaml for a synthetic-ontology test case (TC)
+and a fixed training mode (no_pretrain | p1 | p2), both chosen on the CLI.
 
 Walk corpora are written to a temporary directory and deleted after each run (not kept under
 output/). Protographs, checkpoints, loss plots/CSVs, eval_metrics.txt (stdout from
 evaluate_embeddings.py), and params.json remain in each run_* folder. With evaluation enabled,
 a tqdm bar shows the last run's test accuracy and the best accuracy so far (and the run index
-of the best).
+of the best). best_run.json is updated after each completed run (and on Ctrl+C / SIGTERM) so you
+always have the best-so-far on disk, even if you stop the job early.
 
 Example:
-  uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12
-  uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --dry-run
-  uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --limit 3
-  uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --random-search --limit 20
-  uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --jobs 4
+  uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --training-mode p2
+  uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --training-mode no_pretrain --dry-run
+  uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --training-mode p1 --limit 3
+  uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --training-mode p2 --random-search --limit 20
+  uv run scripts/run_grid_search.py conf/grid_search.yaml --tc tc12 --training-mode p2 --jobs 4
 """
 
 from __future__ import annotations
@@ -25,12 +27,13 @@ import json
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -47,6 +50,11 @@ except ModuleNotFoundError as e:
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def sweep_dir_name(tc: str, training_mode: str) -> str:
+    """Single output folder segment: <tc>_rdf2vec_<training_mode> (e.g. tc12_rdf2vec_p2)."""
+    return f"{tc}_rdf2vec_{training_mode}"
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -73,12 +81,11 @@ def _sample_from_lists(lists: dict[str, list[Any]], rng: random.Random) -> dict[
     return out
 
 
-def sample_random_run(cfg: dict[str, Any], rng: random.Random) -> tuple[str, dict[str, Any]]:
-    """Sample a single configuration: one training_mode, then one value per hyperparameter list."""
-    modes = as_list(cfg.get("training_mode"))
-    if not modes:
-        raise SystemExit("training_mode is empty in config")
-    tm = str(rng.choice(modes)).strip()
+def sample_random_run(
+    cfg: dict[str, Any], rng: random.Random, tm: str
+) -> tuple[str, dict[str, Any]]:
+    """Sample one configuration: one draw per hyperparameter list for the given training mode."""
+    tm = str(tm).strip()
 
     pre = cfg.get("pretrain") or {}
     fin = cfg.get("finetune") or {}
@@ -92,7 +99,7 @@ def sample_random_run(cfg: dict[str, Any], rng: random.Random) -> tuple[str, dic
         w2v_lists = {k: v for k, v in fin_w2v.items() if k != "finetune_epochs"}
         if not w2v_lists.get("epochs"):
             raise SystemExit(
-                "finetune.word2vec.epochs is required when training_mode may be no_pretrain"
+                "finetune.word2vec.epochs is required when --training-mode is no_pretrain"
             )
         flat = {
             "training_mode": tm,
@@ -101,11 +108,11 @@ def sample_random_run(cfg: dict[str, Any], rng: random.Random) -> tuple[str, dic
         }
         return tm, flat
 
-    if tm in ("P1", "P2"):
+    if tm in ("p1", "p2"):
         w2v_lists = {k: v for k, v in fin_w2v.items() if k != "epochs"}
         if not w2v_lists.get("finetune_epochs"):
             raise SystemExit(
-                "finetune.word2vec.finetune_epochs is required when training_mode may be P1 or P2"
+                "finetune.word2vec.finetune_epochs is required when --training-mode is p1 or p2"
             )
         flat = {
             "training_mode": tm,
@@ -116,7 +123,7 @@ def sample_random_run(cfg: dict[str, Any], rng: random.Random) -> tuple[str, dic
         }
         return tm, flat
 
-    raise SystemExit(f"Unknown training_mode: {tm!r} (expected no_pretrain, P1, P2)")
+    raise SystemExit(f"Unknown training_mode: {tm!r} (expected no_pretrain, p1, p2)")
 
 
 def dict_product(d: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -265,9 +272,9 @@ def tc_paths(tc: str, root: Path) -> dict[str, Path]:
     }
 
 
-def iter_runs(cfg: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any]]]:
-    """Yield (training_mode, flat_param_dict) for each grid point."""
-    modes = as_list(cfg.get("training_mode"))
+def iter_runs(cfg: dict[str, Any], tm: str) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield (training_mode, flat_param_dict) for each grid point for the given training mode."""
+    tm = str(tm).strip()
     pre = cfg.get("pretrain") or {}
     fin = cfg.get("finetune") or {}
 
@@ -276,42 +283,40 @@ def iter_runs(cfg: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any]]]:
     fin_w = normalize_walk_block(fin.get("walks"))
     fin_w2v = normalize_w2v_block(fin.get("word2vec"))
 
-    for tm in modes:
-        tm = str(tm).strip()
-        if tm == "no_pretrain":
-            w2v = {k: v for k, v in fin_w2v.items() if k != "finetune_epochs"}
-            if not w2v.get("epochs"):
-                raise SystemExit(
-                    "finetune.word2vec.epochs is required when training_mode includes no_pretrain"
-                )
-            for fw in dict_product(fin_w):
-                for fv in dict_product(w2v):
-                    flat = {
-                        "training_mode": tm,
-                        "finetune_walks": fw,
-                        "finetune_word2vec": fv,
-                    }
-                    yield tm, flat
-        elif tm in ("P1", "P2"):
-            w2v = {k: v for k, v in fin_w2v.items() if k != "epochs"}
-            if not w2v.get("finetune_epochs"):
-                raise SystemExit(
-                    "finetune.word2vec.finetune_epochs is required when training_mode includes P1 or P2"
-                )
-            for pw in dict_product(pre_w):
-                for p2v in dict_product(pre_w2v):
-                    for fw in dict_product(fin_w):
-                        for fv in dict_product(w2v):
-                            flat = {
-                                "training_mode": tm,
-                                "pretrain_walks": pw,
-                                "pretrain_word2vec": p2v,
-                                "finetune_walks": fw,
-                                "finetune_word2vec": fv,
-                            }
-                            yield tm, flat
-        else:
-            raise SystemExit(f"Unknown training_mode: {tm!r} (expected no_pretrain, P1, P2)")
+    if tm == "no_pretrain":
+        w2v = {k: v for k, v in fin_w2v.items() if k != "finetune_epochs"}
+        if not w2v.get("epochs"):
+            raise SystemExit(
+                "finetune.word2vec.epochs is required when --training-mode is no_pretrain"
+            )
+        for fw in dict_product(fin_w):
+            for fv in dict_product(w2v):
+                flat = {
+                    "training_mode": tm,
+                    "finetune_walks": fw,
+                    "finetune_word2vec": fv,
+                }
+                yield tm, flat
+    elif tm in ("p1", "p2"):
+        w2v = {k: v for k, v in fin_w2v.items() if k != "epochs"}
+        if not w2v.get("finetune_epochs"):
+            raise SystemExit(
+                "finetune.word2vec.finetune_epochs is required when --training-mode is p1 or p2"
+            )
+        for pw in dict_product(pre_w):
+            for p2v in dict_product(pre_w2v):
+                for fw in dict_product(fin_w):
+                    for fv in dict_product(w2v):
+                        flat = {
+                            "training_mode": tm,
+                            "pretrain_walks": pw,
+                            "pretrain_word2vec": p2v,
+                            "finetune_walks": fw,
+                            "finetune_word2vec": fv,
+                        }
+                        yield tm, flat
+    else:
+        raise SystemExit(f"Unknown --training-mode: {tm!r} (expected no_pretrain, p1, p2)")
 
 
 def run_one(
@@ -399,7 +404,7 @@ def run_one(
 
         prot_p1 = run_dir / "protograph_p1.nt"
         prot_p2 = run_dir / "protograph_p2.nt"
-        walks_proto = walk_dir / ("walks_p1.txt" if tm == "P1" else "walks_p2.txt")
+        walks_proto = walk_dir / ("walks_p1.txt" if tm == "p1" else "walks_p2.txt")
         pw = flat["pretrain_walks"]
         p2v = flat["pretrain_word2vec"]
         fw = flat["finetune_walks"]
@@ -418,14 +423,13 @@ def run_one(
         ]
         run_cmd(prot_argv, cwd=root, dry_run=dry_run)
 
-        proto_nt = prot_p1 if tm == "P1" else prot_p2
+        proto_nt = prot_p1 if tm == "p1" else prot_p2
         _walk_cmd(proto_nt, walks_proto, pw)
         _walk_cmd(graph_nt, walks_instance, fw)
 
-        mode_flag = "p1" if tm == "P1" else "p2"
         train_extra = [
             "--mode",
-            mode_flag,
+            tm,
             "--pretrain-walks",
             str(walks_proto),
             "--instance-walks",
@@ -476,6 +480,23 @@ class GridRunOutcome:
     manifest_status: str
     sys_exit_code: int | None
     reraise: Exception | None
+
+
+@dataclass
+class SweepProgress:
+    """Mutable sweep state for tqdm, best_run.json, and signal-handler flush."""
+
+    out_root: Path
+    tc: str
+    training_mode: str
+    no_eval: bool
+    dry_run: bool
+    planned_runs: int
+    runs_completed: int = 0
+    best_acc: float | None = None
+    best_run_idx: int | None = None
+    best_outcome: GridRunOutcome | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def _execute_grid_point(
@@ -537,6 +558,73 @@ def _execute_grid_point(
         )
 
 
+def write_best_run_record(
+    out_root: Path,
+    *,
+    tc: str,
+    training_mode: str,
+    no_eval: bool,
+    dry_run: bool,
+    best_outcome: GridRunOutcome | None,
+    runs_completed: int,
+    planned_runs: int,
+    sweep_status: str,
+) -> None:
+    """Write best_run.json: best-so-far accuracy run and sweep progress (updated often during a sweep)."""
+    if dry_run:
+        return
+    record: dict[str, Any] = {
+        "tc": tc,
+        "training_mode": training_mode,
+        "sweep_output_dir": str(out_root.resolve()),
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sweep_status": sweep_status,
+        "runs_completed": runs_completed,
+        "planned_runs": planned_runs,
+    }
+    if no_eval:
+        record["best"] = None
+        record["reason"] = "evaluation disabled (--no-eval)"
+    elif best_outcome is None or best_outcome.test_accuracy is None:
+        record["best"] = None
+        if runs_completed == 0:
+            record["reason"] = "no runs completed yet"
+        else:
+            record["reason"] = "no run completed evaluation with a parsed test accuracy yet"
+    else:
+        run_dir = out_root / f"run_{best_outcome.run_index:04d}"
+        record["best"] = {
+            "run_index": best_outcome.run_index,
+            "test_accuracy": best_outcome.test_accuracy,
+            "run_dir": str(run_dir.resolve()),
+            "params": best_outcome.flat,
+        }
+    (out_root / "best_run.json").write_text(
+        json.dumps(record, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def flush_best_run(progress: SweepProgress, sweep_status: str) -> None:
+    """Snapshot progress to disk (thread-safe read of progress fields)."""
+    if progress.dry_run:
+        return
+    with progress.lock:
+        bo = progress.best_outcome
+        rc = progress.runs_completed
+    write_best_run_record(
+        progress.out_root,
+        tc=progress.tc,
+        training_mode=progress.training_mode,
+        no_eval=progress.no_eval,
+        dry_run=progress.dry_run,
+        best_outcome=bo,
+        runs_completed=rc,
+        planned_runs=progress.planned_runs,
+        sweep_status=sweep_status,
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Run grid or random search from YAML for a TC under v1/synthetic_ontology/<TC>/.",
@@ -552,10 +640,23 @@ def main() -> None:
         help="Test case id (folder v1/synthetic_ontology/<TC>/synthetic_ontology/)",
     )
     ap.add_argument(
+        "--training-mode",
+        required=True,
+        metavar="MODE",
+        choices=("no_pretrain", "p1", "p2"),
+        help=(
+            "Training recipe for this sweep: no_pretrain (--mode none on instance walks), "
+            "p1, or p2 (protograph pretrain then finetune). Not part of the grid YAML."
+        ),
+    )
+    ap.add_argument(
         "--output-root",
         type=Path,
         default=None,
-        help="Directory under repo root for this sweep (default: output/grid_search/<tc>/<timestamp>/)",
+        help=(
+            "Directory under repo root for this sweep "
+            "(default: output/grid_search/<tc>_rdf2vec_<mode>/<timestamp>/)"
+        ),
     )
     ap.add_argument(
         "--dry-run",
@@ -628,7 +729,7 @@ def main() -> None:
     out_root = args.output_root
     if out_root is None:
         sub = "random_search" if args.random_search else "grid_search"
-        out_root = root / "output" / sub / args.tc / stamp
+        out_root = root / "output" / sub / sweep_dir_name(args.tc, args.training_mode) / stamp
     else:
         out_root = out_root if out_root.is_absolute() else root / out_root
 
@@ -637,9 +738,9 @@ def main() -> None:
         if args.limit is None or args.limit < 1:
             raise SystemExit("--random-search requires --limit N (number of sampled trials, >= 1)")
         rng = random.Random(args.random_seed)
-        runs = [sample_random_run(cfg, rng) for _ in range(args.limit)]
+        runs = [sample_random_run(cfg, rng, args.training_mode) for _ in range(args.limit)]
     else:
-        runs = list(iter_runs(cfg))
+        runs = list(iter_runs(cfg, args.training_mode))
         if args.limit is not None:
             runs = runs[: max(0, args.limit)]
 
@@ -648,6 +749,9 @@ def main() -> None:
         out_root.mkdir(parents=True, exist_ok=True)
         (out_root / "config_copy.yaml").write_text(cfg_path.read_text(encoding="utf-8"), encoding="utf-8")
         meta = {
+            "tc": args.tc,
+            "training_mode": args.training_mode,
+            "sweep_dir": sweep_dir_name(args.tc, args.training_mode),
             "search": search_label,
             "random_seed": args.random_seed if args.random_search else None,
             "n_runs": len(runs),
@@ -697,18 +801,32 @@ def main() -> None:
     if args.jobs < 1:
         raise SystemExit("--jobs must be >= 1")
 
-    best_acc: float | None = None
-    best_run_idx: int | None = None
-    best_lock = threading.Lock()
+    progress = SweepProgress(
+        out_root=out_root,
+        tc=args.tc,
+        training_mode=args.training_mode,
+        no_eval=args.no_eval,
+        dry_run=args.dry_run,
+        planned_runs=len(runs),
+    )
+
+    def _sigterm_to_keyboard_interrupt(_signum: int, _frame: Any) -> None:
+        """SIGTERM does not raise KeyboardInterrupt by default; map it so try/finally can flush."""
+        raise KeyboardInterrupt
+
+    if not args.dry_run:
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _sigterm_to_keyboard_interrupt)
+        flush_best_run(progress, "running")
 
     def update_postfix(pbar: tqdm, outcome: GridRunOutcome) -> None:
-        nonlocal best_acc, best_run_idx
         acc = outcome.test_accuracy
-        with best_lock:
-            if acc is not None and (best_acc is None or acc > best_acc):
-                best_acc = acc
-                best_run_idx = outcome.run_index
-            ba, br = best_acc, best_run_idx
+        with progress.lock:
+            if acc is not None and (progress.best_acc is None or acc > progress.best_acc):
+                progress.best_acc = acc
+                progress.best_run_idx = outcome.run_index
+                progress.best_outcome = outcome
+            ba, br = progress.best_acc, progress.best_run_idx
         postfix: dict[str, str] = {}
         if not args.no_eval:
             postfix["last"] = f"{acc:.4f}" if acc is not None else "—"
@@ -720,7 +838,7 @@ def main() -> None:
         pbar.set_postfix(postfix, refresh=True)
 
     def handle_outcome(pbar: tqdm, outcome: GridRunOutcome, *, manifest_lock: threading.Lock | None) -> None:
-        """Write manifest row; update tqdm; re-raise or exit like the original sequential loop."""
+        """Write manifest row; update tqdm; persist best_run.json; re-raise or exit like the original loop."""
         def do_write() -> None:
             write_manifest_row(
                 outcome.run_index,
@@ -736,6 +854,8 @@ def main() -> None:
         else:
             do_write()
         update_postfix(pbar, outcome)
+        progress.runs_completed += 1
+        flush_best_run(progress, "running")
         if outcome.reraise is not None:
             raise outcome.reraise
         if outcome.sys_exit_code is not None:
@@ -750,54 +870,67 @@ def main() -> None:
         seed=args.seed,
     )
 
-    if args.jobs == 1:
-        pbar = tqdm(
-            enumerate(runs, start=1),
-            total=len(runs),
-            desc="grid search",
-            unit="run",
-            dynamic_ncols=True,
-            file=sys.stderr,
-            leave=True,
-        )
-        for i, (tm, flat) in pbar:
-            pbar.set_description_str(f"[{i}/{len(runs)}] {tm}", refresh=False)
-            outcome = _execute_grid_point(run_index=i, tm=tm, flat=flat, **common_kw)
-            handle_outcome(pbar, outcome, manifest_lock=None)
-    else:
-        tasks = [(i, tm, flat) for i, (tm, flat) in enumerate(runs, start=1)]
-        manifest_lock = threading.Lock()
-        pbar = tqdm(
-            total=len(runs),
-            desc="grid search",
-            unit="run",
-            dynamic_ncols=True,
-            file=sys.stderr,
-            leave=True,
-        )
-        executor = ThreadPoolExecutor(max_workers=args.jobs)
-        try:
-            future_map = {}
-            for i, tm, flat in tasks:
-                fut = executor.submit(
-                    _execute_grid_point,
-                    run_index=i,
-                    tm=tm,
-                    flat=flat,
-                    **common_kw,
-                )
-                future_map[fut] = (i, tm)
-            for fut in as_completed(future_map):
-                i, tm = future_map[fut]
-                pbar.set_description_str(f"[done {i}/{len(runs)}] {tm}", refresh=False)
-                outcome = fut.result()
-                handle_outcome(pbar, outcome, manifest_lock=manifest_lock)
-                pbar.update(1)
-        except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
+    completed_normally = False
+    try:
+        if args.jobs == 1:
+            pbar = tqdm(
+                enumerate(runs, start=1),
+                total=len(runs),
+                desc="grid search",
+                unit="run",
+                dynamic_ncols=True,
+                file=sys.stderr,
+                leave=True,
+            )
+            for i, (tm, flat) in pbar:
+                pbar.set_description_str(f"[{i}/{len(runs)}] {tm}", refresh=False)
+                outcome = _execute_grid_point(run_index=i, tm=tm, flat=flat, **common_kw)
+                handle_outcome(pbar, outcome, manifest_lock=None)
         else:
-            executor.shutdown(wait=True)
+            tasks = [(i, tm, flat) for i, (tm, flat) in enumerate(runs, start=1)]
+            manifest_lock = threading.Lock()
+            pbar = tqdm(
+                total=len(runs),
+                desc="grid search",
+                unit="run",
+                dynamic_ncols=True,
+                file=sys.stderr,
+                leave=True,
+            )
+            executor = ThreadPoolExecutor(max_workers=args.jobs)
+            try:
+                future_map = {}
+                for i, tm, flat in tasks:
+                    fut = executor.submit(
+                        _execute_grid_point,
+                        run_index=i,
+                        tm=tm,
+                        flat=flat,
+                        **common_kw,
+                    )
+                    future_map[fut] = (i, tm)
+                for fut in as_completed(future_map):
+                    i, tm = future_map[fut]
+                    pbar.set_description_str(f"[done {i}/{len(runs)}] {tm}", refresh=False)
+                    outcome = fut.result()
+                    handle_outcome(pbar, outcome, manifest_lock=manifest_lock)
+                    pbar.update(1)
+            except BaseException:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True)
+        completed_normally = True
+    finally:
+        if not args.dry_run:
+            flush_best_run(progress, "complete" if completed_normally else "interrupted")
+
+    if not args.dry_run and not args.no_eval and progress.best_outcome is not None and progress.best_outcome.test_accuracy is not None:
+        tqdm.write(
+            f"Best test accuracy: {progress.best_outcome.test_accuracy:.6f}  "
+            f"(run_{progress.best_outcome.run_index:04d})  →  {out_root / 'best_run.json'}",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
