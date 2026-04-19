@@ -83,16 +83,31 @@ def build_adjacency(
 ) -> tuple[dict[str, list[str]], list[str]]:
     neighbors: dict[str, set[str]] = defaultdict(set)
     all_nodes: set[str] = set()
-    for s, _p, o in iter_nt_triples(path):
-        all_nodes.add(s)
-        all_nodes.add(o)
-        if directed:
-            neighbors[s].add(o)
-        else:
-            neighbors[s].add(o)
-            neighbors[o].add(s)
+    with path.open(encoding="utf-8") as f:
+        for line in tqdm(
+            f,
+            desc="Scanning N-Triples (adjacency)",
+            unit="line",
+            dynamic_ncols=True,
+            colour="cyan",
+            mininterval=0.25,
+        ):
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            m = TRIPLE_LINE.match(line)
+            if not m:
+                raise ValueError(f"Unrecognized N-Triples line: {line[:200]}")
+            s, _p, o = m.group(1), m.group(2), m.group(3)
+            all_nodes.add(s)
+            all_nodes.add(o)
+            if directed:
+                neighbors[s].add(o)
+            else:
+                neighbors[s].add(o)
+                neighbors[o].add(s)
 
-    adj = {n: list(neighbors[n]) for n in all_nodes}
+    adj = {n: list(neighbors[n]) for n in tqdm(all_nodes, desc="Materializing neighbor lists", unit="node", dynamic_ncols=True, colour="cyan", mininterval=0.5)}
     return adj, list(all_nodes)
 
 
@@ -120,8 +135,23 @@ def random_walk(
 def build_forward_adjacency(path: Path) -> dict[str, list[Triple]]:
     """subject -> outgoing object triples (same as jRDF2Vec ``getObjectTriplesInvolvingSubject``)."""
     adj: dict[str, list[Triple]] = defaultdict(list)
-    for s, p, o in iter_nt_object_triples_lenient(path):
-        adj[s].append(Triple(s, p, o))
+    with path.open(encoding="utf-8") as f:
+        for line in tqdm(
+            f,
+            desc="Scanning N-Triples (forward adjacency)",
+            unit="line",
+            dynamic_ncols=True,
+            colour="cyan",
+            mininterval=0.25,
+        ):
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            m = TRIPLE_LINE.match(line)
+            if not m:
+                continue
+            s, p, o = m.group(1), m.group(2), m.group(3)
+            adj[s].append(Triple(s, p, o))
     return {k: v for k, v in adj.items()}
 
 
