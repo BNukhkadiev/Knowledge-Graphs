@@ -20,7 +20,9 @@ mlruns/
 # Cursor IDE (local workspace/agent state — not shared across clones)
 .cursor/
 
-# LaTeX: only version seminar.tex and references.bib; ignore build artifacts
+# LaTeX: only version seminar.tex, references.bib, and assets/; ignore build artifacts
 latex/**
 !latex/references.bib
 !latex/seminar.tex
+!latex/assets/
+!latex/assets/**

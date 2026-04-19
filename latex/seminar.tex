@@ -228,13 +228,64 @@ We reference Table 4 specifically because it has results for Node classification
 
 P2 is a little more promising, however it can clearly be seen that it is unstable and sometimes shows ~10\% improvement and sometimes ~10\% degradation.
 
-\subsection{Building Protograph}
+\subsection{Building a Protograph}
+We utilize strategies described in \cite{hubert2024treatdifferentnegativesdifferently} for constructing protographs. The strategies are P1 and P2. 
 
 
 \subsection{Training on Protograph}
 
+Before starting to train on Protographs, it is important to make create an assumption that we fix the Word2Vec training and Random Walks configurations.
+That way we will be able to judge the effect of P1, P2 strategies. To explore the stability we will toggle the random seed and average the metrics. 
+
+
 So far training on P1 protograph is quite unstable that might be due to the fact that it has too little data. Another drawback of P1 strategy is also pointed out in original paper:
 if schema has many abstract classes that do not have any direct instances, then embeddings of these classes will not be trasferred to the instance embeddings. Thus, resulting in inefficient pretraining. 
+
+
+
+\subsection{Evaluating the Pretrain Stage}
+In this section we will evaluate on the TC's the pretrained models and compare them to each other. 
+This requires us to evaluate the pretrained embeddings on the test cases without fine-tuning on the instance graph.
+Table~\ref{tab:dlcc-pretrain-stage-eval} compares frozen entity vectors when Word2Vec is trained on instance walks only (\textit{V}) versus weights after protograph pretraining (\textit{P1}, \textit{P2}), each without subsequent fine-tuning on the instance graph.
+
+\begingroup
+\newcommand{\D}{\textemdash{}}
+\begin{table}[t]
+  \centering
+  \caption{DLCC synthetic ontology: pretrain-stage evaluation. Binary node classification with a logistic regression on frozen entity vectors. \textit{V} denotes embeddings from Word2Vec on instance walks only; \textit{P1} and \textit{P2} denote embeddings after protograph pretraining only. All entries are \textbf{accuracy} on the test set, reported as point estimate $\pm$ bootstrap standard error once runs are complete.}
+  \label{tab:dlcc-pretrain-stage-eval}
+  \footnotesize
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    TC & V & P1 & P2 \\
+    \midrule
+    TC01 & \D & \D & \D \\
+    TC02 & \D & \D & \D \\
+    TC03 & \D & \D & \D \\
+    TC04 & \D & \D & \D \\
+    TC05 & \D & \D & \D \\
+    TC06 & \D & \D & \D \\
+    TC07 & \D & \D & \D \\
+    TC08 & \D & \D & \D \\
+    TC09 & \D & \D & \D \\
+    TC10 & \D & \D & \D \\
+    TC11 & \D & \D & \D \\
+    TC12 & \D & \D & \D \\
+    \midrule
+    Macro avg.
+      & \D & \D & \D \\
+    \bottomrule
+  \end{tabular}
+  \vspace{0.4em}
+  \par\noindent\small\textit{Note:} Macro avg.\ is the unweighted mean of accuracy over TC01--TC12 for each column. Replace placeholders with $m \pm \sigma$ once runs are complete.
+\end{table}
+\endgroup
+
+
+
+
+\subsection{Hyperparameter Tuning}
 
 The initial results of training on P2 and P1 protographs are not as promising as we hoped. Maybe to make it work we need to perform a more careful hyperparameter tuning. 
 For that we start a hyperparameter grid search. For each difficult TC (TC07--TC12) we will run 5 runs of RDF2Vec with different hyperparameters and report the best results.
