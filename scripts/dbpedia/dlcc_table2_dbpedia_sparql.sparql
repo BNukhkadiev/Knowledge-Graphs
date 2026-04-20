@@ -1,0 +1,231 @@
+# =============================================================================
+# DLCC (Portisch & Paulheim, arXiv:2207.06014) — Table 2: Exemplary SPARQL
+# queries for class dbo:Person (people domain). Reconstructed from the paper;
+# namespace abbreviations normalized (e.g. dbr:New_York_City).
+#
+# The paper states that the gold-standard generator uses *more involved*
+# queries (size / randomization) and that 200+ hand-written queries live in:
+#   https://github.com/janothan/DL-TC-Generator/tree/master/src/main/resources/queries
+#
+# Endpoint (paper): DBpedia 2021-09; any DBpedia SPARQL endpoint can be used:
+#   https://dbpedia.org/sparql
+#
+# tc02, tc05, tc08, tc10, tc12: analogous inverse / two-hop variants — see
+# generator repo or paper prose for full text.
+# =============================================================================
+
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+
+# ----------------------------------------------------------------------------- tc01  ∃r.>
+# Positive
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  ?x dbo:child ?y .
+}
+
+# Negative
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  FILTER NOT EXISTS { ?x dbo:child ?z }
+}
+
+# Negative (hard)
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  ?y dbo:child ?x .
+  FILTER NOT EXISTS { ?x dbo:child ?z }
+}
+
+# ----------------------------------------------------------------------------- tc02
+# Paper: "Analogous to tc01 (inverse case)." — see DL-TC-Generator resources.
+
+# ----------------------------------------------------------------------------- tc03  ∃r.> ⊓ ∃r⁻¹.>
+# Positive
+SELECT DISTINCT ?x WHERE {
+  { ?x a dbo:Person . ?x dbo:child ?y }
+  UNION
+  { ?x a dbo:Person . ?y dbo:child ?x }
+}
+
+# Negative (paper uses COUNT — illustrative; generator may use DISTINCT ?x)
+SELECT (COUNT(?x) AS ?cnt) WHERE {
+  ?x a dbo:Person .
+  FILTER (
+    NOT EXISTS { ?x dbo:child ?y }
+    && NOT EXISTS { ?z dbo:child ?x }
+  )
+}
+
+# Negative (hard): — (not in paper table)
+
+# ----------------------------------------------------------------------------- tc04  ∃R.{e} ⊔ ∃R⁻¹.{e}
+# Positive
+SELECT DISTINCT ?x WHERE {
+  {
+    ?x a dbo:Person .
+    ?x ?y dbr:New_York_City
+  } UNION {
+    ?x a dbo:Person .
+    dbr:New_York_City ?y ?x
+  }
+}
+
+# Negative
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  FILTER (
+    NOT EXISTS { ?x ?y dbr:New_York_City }
+    && NOT EXISTS { dbr:New_York_City ?y ?x }
+  )
+}
+
+# Negative (hard)
+SELECT DISTINCT ?x WHERE {
+  {
+    ?x a dbo:Person .
+    ?x ?y1 ?z .
+    ?z ?y2 dbr:New_York_City
+  } UNION {
+    ?x a dbo:Person .
+    ?z ?y1 ?x .
+    dbr:New_York_City ?y2 ?z
+  }
+  FILTER (
+    NOT EXISTS { ?x ?r dbr:New_York_City }
+    && NOT EXISTS { dbr:New_York_City ?s ?x }
+  )
+}
+
+# ----------------------------------------------------------------------------- tc05
+# Paper: "Analogous to tc04 (inverse case)."
+
+# ----------------------------------------------------------------------------- tc06  ∃r.{e}
+# Positive
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  ?x dbo:birthPlace dbr:New_York_City .
+}
+
+# Negative
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  FILTER NOT EXISTS { ?x dbo:birthPlace dbr:New_York_City }
+}
+
+# Negative (hard)
+SELECT DISTINCT ?x ?r WHERE {
+  {
+    ?x a dbo:Person .
+    ?x dbo:birthPlace ?y .
+    dbr:New_York_City ?r ?x .
+    FILTER (?y != dbr:New_York_City)
+  } UNION {
+    ?x a dbo:Person .
+    ?x dbo:birthPlace ?y .
+    ?x ?r dbr:New_York_City .
+    FILTER (?y != dbr:New_York_City)
+  }
+}
+
+# ----------------------------------------------------------------------------- tc07  ∃r.T (qualified)
+# Positive
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  ?x dbo:team ?y .
+  ?y a dbo:BasketballTeam .
+}
+
+# Negative
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  FILTER NOT EXISTS {
+    ?x dbo:team ?y .
+    ?y a dbo:BasketballTeam
+  }
+}
+
+# Negative (hard)
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  ?x dbo:team ?z1 .
+  ?x ?r ?z2 .
+  ?z2 a dbo:BaseballTeam .
+  FILTER NOT EXISTS {
+    ?x dbo:team ?y .
+    ?y a dbo:BasketballTeam
+  }
+}
+
+# ----------------------------------------------------------------------------- tc08
+# Paper: "Analogous to tc07 (inverse case)."
+
+# ----------------------------------------------------------------------------- tc09  ≥2r.>
+# Positive
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  ?x dbo:award ?y1 .
+  ?x dbo:award ?y2 .
+  FILTER (?y1 != ?y2)
+}
+
+# Negative
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  FILTER NOT EXISTS {
+    ?x dbo:award ?y1 .
+    ?x dbo:award ?y2 .
+    FILTER (?y1 != ?y2)
+  }
+}
+
+# Negative (hard)
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  ?x dbo:award ?y .
+  FILTER NOT EXISTS {
+    ?x dbo:award ?z .
+    FILTER (?y != ?z)
+  }
+}
+
+# ----------------------------------------------------------------------------- tc10
+# Paper: "Analogous to tc09 (inverse case)."
+
+# ----------------------------------------------------------------------------- tc11  ≥2r.T
+# Positive
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  ?x dbo:recordLabel ?y1 .
+  ?y1 a dbo:RecordLabel .
+  ?x dbo:recordLabel ?y2 .
+  ?y2 a dbo:RecordLabel .
+  FILTER (?y1 != ?y2)
+}
+
+# Negative
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  FILTER NOT EXISTS {
+    ?x dbo:recordLabel ?y1 .
+    ?y1 a dbo:RecordLabel .
+    ?x dbo:recordLabel ?y2 .
+    ?y2 a dbo:RecordLabel .
+    FILTER (?y1 != ?y2)
+  }
+}
+
+# Negative (hard)
+SELECT DISTINCT ?x WHERE {
+  ?x a dbo:Person .
+  ?x dbo:recordLabel ?y1 .
+  ?y1 a dbo:RecordLabel .
+  FILTER NOT EXISTS {
+    ?x dbo:recordLabel ?y2 .
+    ?y2 a dbo:RecordLabel .
+    FILTER (?y1 != ?y2)
+  }
+}
+
+# ----------------------------------------------------------------------------- tc12
+# Paper: "Analogous to tc11 (inverse case)."

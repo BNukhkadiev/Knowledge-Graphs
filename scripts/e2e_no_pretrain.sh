@@ -23,7 +23,11 @@ BASE_ONTO="${REPO_ROOT}/v1/synthetic_ontology/${TC}/synthetic_ontology"
 GRAPH_NT="${BASE_ONTO}/graph.nt"
 TEST_TXT="${BASE_ONTO}/1000/train_test/test.txt"
 
+# Optional: reuse the same instance walks file as P1/P2 (see scripts/run_rdf2vec_fixed_e2e.py).
 WALKS_FILE="${OUT}/walks.txt"
+if [[ -n "${PRECOMPUTED_INSTANCE_WALKS:-}" ]]; then
+  WALKS_FILE="${PRECOMPUTED_INSTANCE_WALKS}"
+fi
 CHECKPOINT="${OUT}/rdf2vec_word2vec.pt"
 RUN_LOG="${OUT}/run.log"
 
@@ -33,11 +37,15 @@ exec > >(tee "${RUN_LOG}") 2>&1
 echo "Output directory: ${OUT}"
 echo "Full log (stdout+stderr): ${RUN_LOG}"
 
-echo "== 1/3 Random walks → ${WALKS_FILE}"
-uv run src/walk/random_walks.py "${GRAPH_NT}" "${WALKS_FILE}" \
-  --mode "jrdf2vec-duplicate-free" \
-  --depth 4 \
-  --walks-per-entity 100
+if [[ -n "${PRECOMPUTED_INSTANCE_WALKS:-}" ]]; then
+  echo "== 1/3 Skip random walks (PRECOMPUTED_INSTANCE_WALKS=${WALKS_FILE})"
+else
+  echo "== 1/3 Random walks → ${WALKS_FILE}"
+  uv run src/walk/random_walks.py "${GRAPH_NT}" "${WALKS_FILE}" \
+    --mode "jrdf2vec-duplicate-free" \
+    --depth 4 \
+    --walks-per-entity 100
+fi
 
 echo "== 2/3 Train Word2Vec (RDF2Vec) → ${CHECKPOINT}"
 uv run src/train/train_word2vec.py "${WALKS_FILE}" \

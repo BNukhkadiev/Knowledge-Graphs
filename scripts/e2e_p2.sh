@@ -30,6 +30,9 @@ PROT_P1_NT="${OUT}/protograph_p1.nt"
 PROT_P2_NT="${OUT}/protograph_p2.nt"
 WALKS_P2="${OUT}/walks_p2.txt"
 WALKS_INSTANCE="${OUT}/walks_instance.txt"
+if [[ -n "${PRECOMPUTED_INSTANCE_WALKS:-}" ]]; then
+  WALKS_INSTANCE="${PRECOMPUTED_INSTANCE_WALKS}"
+fi
 CHECKPOINT="${OUT}/rdf2vec_final.pt"
 RUN_LOG="${OUT}/run.log"
 
@@ -64,11 +67,15 @@ uv run src/walk/random_walks.py "${PROT_P2_NT}" "${WALKS_P2}" \
   --depth 4 \
   --walks-per-entity 100
 
-echo "== 3/5 Random walks on instance KG → ${WALKS_INSTANCE}"
-uv run src/walk/random_walks.py "${GRAPH_NT}" "${WALKS_INSTANCE}" \
-  --mode "jrdf2vec-duplicate-free" \
-  --depth 4 \
-  --walks-per-entity 100
+if [[ -n "${PRECOMPUTED_INSTANCE_WALKS:-}" ]]; then
+  echo "== 3/5 Skip instance walks (PRECOMPUTED_INSTANCE_WALKS=${WALKS_INSTANCE})"
+else
+  echo "== 3/5 Random walks on instance KG → ${WALKS_INSTANCE}"
+  uv run src/walk/random_walks.py "${GRAPH_NT}" "${WALKS_INSTANCE}" \
+    --mode "jrdf2vec-duplicate-free" \
+    --depth 4 \
+    --walks-per-entity 100
+fi
 
 echo "== 4/5 Train Word2Vec (P2 pretrain + instance finetune) → ${CHECKPOINT}"
 uv run src/train/train_word2vec.py \
