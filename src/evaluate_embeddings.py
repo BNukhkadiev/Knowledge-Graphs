@@ -52,6 +52,16 @@ def tokens_to_embeddings(
     chunk_size: int,
 ) -> tuple[np.ndarray, int]:
     """Map tokens to embedding rows; OOV tokens get a zero vector. Returns (matrix, n_oov)."""
+    def _candidates(t: str) -> tuple[str, ...]:
+        t = t.strip()
+        if not t:
+            return ("",)
+        if (t.startswith("<") and t.endswith(">")) and len(t) > 2:
+            inner = t[1:-1]
+            return (t, inner)
+        # Common for RDF2Vec walks: URIs are stored as "<...>" tokens.
+        return (t, f"<{t}>")
+
     n = len(tokens)
     d = emb.shape[1]
     out = np.zeros((n, d), dtype=np.float32)
@@ -68,7 +78,11 @@ def tokens_to_embeddings(
     ):
         end = min(start + chunk_size, n)
         for i, t in enumerate(tokens[start:end]):
-            j = word2idx.get(t)
+            j = None
+            for cand in _candidates(t):
+                j = word2idx.get(cand)
+                if j is not None:
+                    break
             if j is None:
                 oov += 1
                 continue
