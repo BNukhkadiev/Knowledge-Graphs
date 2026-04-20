@@ -22,7 +22,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from gensim.models import Word2Vec
 from sklearn.decomposition import PCA
 
 from src.evaluate_embeddings import load_embeddings_checkpoint
@@ -78,13 +77,7 @@ def shorten_iri(iri: str, max_len: int = 48) -> str:
 
 
 def load_embeddings_any(path: Path) -> tuple[np.ndarray, dict[str, int]]:
-    """Like ``evaluate_embeddings.load_embeddings_checkpoint`` plus gensim ``.model``."""
-    if path.suffix.lower() == ".model":
-        model = Word2Vec.load(str(path))
-        wv = model.wv
-        emb = np.asarray(wv.vectors, dtype=np.float32)
-        word2idx: dict[str, int] = dict(wv.key_to_index)
-        return emb, word2idx
+    """Same as ``evaluate_embeddings.load_embeddings_checkpoint`` (``.pt``, ``.kv``, ``.model``)."""
     return load_embeddings_checkpoint(path)
 
 

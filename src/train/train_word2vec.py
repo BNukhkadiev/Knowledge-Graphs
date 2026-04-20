@@ -12,6 +12,7 @@ Input: one space-separated walk per line.
 Single-corpus mode logs per-epoch loss, CSV, PNG, optional per-step loss (--loss-every-steps).
 p1/p2 mode writes pretrain_per_epoch.png and protograph_per_epoch.png; per-step PNGs use
 --loss-every-steps-pretrain / --loss-every-steps-finetune (or --loss-every-steps N for both).
+Writes instance_to_class.json (default): ``{ instance_iri_inner: [ class_iri_inner, ... ] }`` from ontology.nt.
 Saves a .pt checkpoint compatible with evaluate_embeddings.py (embeddings + word2idx).
 """
 
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import sys
@@ -35,7 +37,7 @@ from gensim.models.callbacks import CallbackAny2Vec
 from gensim.models.word2vec import LineSentence
 from tqdm.auto import tqdm
 
-from src.protograph.maschine_init import apply_maschine_initialization
+from src.protograph.maschine_init import apply_maschine_initialization, instance_class_mapping_from_ontology
 
 
 def _workers_effective(workers: int) -> int:
@@ -241,6 +243,19 @@ def _plot_loss_per_step(
     plt.close(fig)
 
 
+def save_instance_to_class_json(path: Path, ontology_path: Path | None) -> None:
+    """Write ``{ instance_iri_inner: [ class_iri_inner, ... ] }`` from ontology (MASCHInE most-specific types)."""
+    if ontology_path is None or not ontology_path.is_file():
+        payload: dict[str, list[str]] = {}
+    else:
+        full = instance_class_mapping_from_ontology(ontology_path)
+        payload = {ent: d["most_specific_class_iris"] for ent, d in full.items()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
 def build_gensim_to_pt(model: Word2Vec) -> dict:
     """Checkpoint dict compatible with evaluate_embeddings.py / train_word2vec.py."""
     wv = model.wv
@@ -422,11 +437,15 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
     }
     pre_model.build_vocab(LineSentence(str(instance_path)), update=True)
 
+    new_token_init: dict[str, str] = {}
+    maschine_applied = False
     if args.maschine_init and ontology_path is not None and ontology_path.is_file():
+        maschine_applied = True
         n_ent, n_rel, n_rand = apply_maschine_initialization(
             pre_model,
             stage1_vectors,
             ontology_path,
+            new_token_init=new_token_init,
         )
         print(
             f"MASCHInE init: entity rows from class vectors={n_ent}, "
@@ -436,6 +455,23 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
         print(
             "MASCHInE init skipped (no ontology.nt); pass --ontology or place ontology.nt beside instance walks"
         )
+
+    if not maschine_applied:
+        for w in pre_model.wv.index_to_key:
+            if w not in stage1_vectors:
+                new_token_init[w] = "gensim_default"
+
+    if not args.no_pretrain_init_mapping:
+        map_path = args.pretrain_init_mapping
+        if map_path is None:
+            map_path = out_dir / "instance_to_class.json"
+        elif not map_path.is_absolute():
+            map_path = out_dir / map_path
+        save_instance_to_class_json(
+            map_path,
+            ontology_path if ontology_path is not None and ontology_path.is_file() else None,
+        )
+        print(f"Wrote instance→class mapping: {map_path}")
 
     if finetune_loss_every > 0 and args.workers > 1:
         print(
@@ -913,6 +949,17 @@ def main() -> None:
         "--no-loss-plots",
         action="store_true",
         help="Do not write RDF2Vec loss PNGs.",
+    )
+    p.add_argument(
+        "--pretrain-init-mapping",
+        type=Path,
+        default=None,
+        help="JSON path for instance→class mapping (default: <out-dir>/instance_to_class.json).",
+    )
+    p.add_argument(
+        "--no-pretrain-init-mapping",
+        action="store_true",
+        help="Do not write instance→class JSON.",
     )
 
     args = p.parse_args()

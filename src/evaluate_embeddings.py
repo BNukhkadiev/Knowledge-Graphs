@@ -2,8 +2,9 @@
 """
 Evaluate embeddings on a labeled entity file (node classification).
 
-Checkpoint: PyTorch ``.pt`` from ``train_word2vec.py`` (``embeddings`` + ``word2idx``),
-or gensim ``KeyedVectors`` ``.kv``. RDF2Vec stage-2 output is ``rdf2vec_final.pt``.
+Checkpoint: PyTorch ``.pt`` from ``train_word2vec.py`` (``embeddings`` + ``word2idx``);
+gensim ``KeyedVectors`` ``.kv``; or gensim ``Word2Vec`` ``.model`` (e.g. two-stage
+``rdf2vec_pretrained.model``). RDF2Vec stage-2 output is ``rdf2vec_final.pt``.
 
 Each line: <entity_id>\\t<label> (tab-separated). Trains a logistic regression on
 train.txt embeddings and reports test metrics with bootstrap standard errors.
@@ -16,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from gensim.models import KeyedVectors
+from gensim.models import KeyedVectors, Word2Vec
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from tqdm.auto import tqdm
@@ -141,9 +142,18 @@ def load_embeddings_checkpoint(path: Path) -> tuple[np.ndarray, dict[str, int]]:
         word2idx: dict[str, int] = dict(wv.key_to_index)
         return emb, word2idx
 
+    if suffix == ".model":
+        model = Word2Vec.load(str(path))
+        wv = model.wv
+        emb = np.asarray(wv.vectors, dtype=np.float32)
+        word2idx = dict(wv.key_to_index)
+        return emb, word2idx
+
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if "embeddings" not in ckpt or "word2idx" not in ckpt:
-        raise SystemExit("Checkpoint must contain 'embeddings' and 'word2idx', or use a .kv file.")
+        raise SystemExit(
+            "Checkpoint must contain 'embeddings' and 'word2idx', or use a .kv / .model file."
+        )
     emb_t = ckpt["embeddings"]
     if emb_t.dim() != 2:
         raise SystemExit("'embeddings' must be 2D [vocab, dim].")
@@ -165,7 +175,7 @@ def main() -> None:
         "--checkpoint",
         type=Path,
         required=True,
-        help="Embeddings: .pt (train_word2vec / rdf2vec_final.pt) or gensim .kv",
+        help="Embeddings: .pt (train_word2vec / rdf2vec_final.pt), gensim .kv, or Word2Vec .model",
     )
     p.add_argument(
         "--train",

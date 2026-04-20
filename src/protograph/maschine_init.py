@@ -19,8 +19,27 @@ from src.protograph.protograph_gen import iter_nt_iris
 from src.walk.random_walks import nt_term
 
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-OWL_CLASS = "http://www.w3.org/2002/07/owl#Class"
+RDF_PROPERTY = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
+OWL_NS = "http://www.w3.org/2002/07/owl#"
+OWL_CLASS = f"{OWL_NS}Class"
 RDFS_SUBCLASS = "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+
+# Subjects with any of these as asserted rdf:type are RDF properties, not individuals.
+RDF_PROPERTY_TYPE_IRIS: frozenset[str] = frozenset(
+    {
+        RDF_PROPERTY,
+        f"{OWL_NS}ObjectProperty",
+        f"{OWL_NS}DatatypeProperty",
+        f"{OWL_NS}AnnotationProperty",
+        f"{OWL_NS}FunctionalProperty",
+        f"{OWL_NS}InverseFunctionalProperty",
+        f"{OWL_NS}SymmetricProperty",
+        f"{OWL_NS}AsymmetricProperty",
+        f"{OWL_NS}ReflexiveProperty",
+        f"{OWL_NS}IrreflexiveProperty",
+        f"{OWL_NS}TransitiveProperty",
+    }
+)
 
 # Synthetic DLCC-style extra individuals: EXTRA_I_FOR_CLASS_C_tc07_152_640 -> C_tc07_152
 EXTRA_CLASS_RE = re.compile(r"^EXTRA_I_FOR_CLASS_(C_tc07_\d+)_")
@@ -61,6 +80,14 @@ def _most_specific_types(asserted: set[str], parents: dict[str, set[str]]) -> li
     return minimal
 
 
+def _subject_is_rdf_property(raw_types: dict[str, set[str]], ent: str) -> bool:
+    """True if ``ent`` is declared in the ontology as an RDF/OWL property (not an individual)."""
+    ts = raw_types.get(ent)
+    if not ts:
+        return False
+    return bool(ts & RDF_PROPERTY_TYPE_IRIS)
+
+
 def load_ontology_mapping(ontology_nt: Path) -> tuple[dict[str, set[str]], dict[str, list[str]]]:
     """
     Returns:
@@ -80,10 +107,15 @@ def load_ontology_mapping(ontology_nt: Path) -> tuple[dict[str, set[str]], dict[
             continue
         raw_types[s].add(o)
 
+    raw_dict = dict(raw_types)
     entity_types: dict[str, list[str]] = {}
-    for ent, types in raw_types.items():
+    for ent, types in raw_dict.items():
         mst = _most_specific_types(types, parents)
         entity_types[ent] = mst
+
+    for ent in list(entity_types.keys()):
+        if _subject_is_rdf_property(raw_dict, ent):
+            del entity_types[ent]
 
     return dict(parents), entity_types
 
@@ -93,6 +125,24 @@ def _class_from_extra_name(entity_inner: str) -> str | None:
     if m:
         return m.group(1)
     return None
+
+
+def instance_class_mapping_from_ontology(ontology_nt: Path) -> dict[str, dict[str, list[str]]]:
+    """
+    For each individual in ``ontology_nt`` with ``rdf:type`` (or derivable EXTRA_I_* typing),
+    return most-specific class IRIs and the corresponding walk tokens used for MASCHInE init.
+
+    Keys are **entity IRI strings** (same as N-Triples subject inner, without angle brackets).
+    """
+    parents, entity_types = load_ontology_mapping(ontology_nt)
+    ent_to_tokens = build_entity_to_class_tokens(parents, entity_types)
+    return {
+        ent: {
+            "most_specific_class_iris": list(entity_types[ent]),
+            "class_tokens": list(ent_to_tokens.get(ent, [])),
+        }
+        for ent in entity_types
+    }
 
 
 def build_entity_to_class_tokens(
@@ -132,10 +182,16 @@ def apply_maschine_initialization(
     model: Word2Vec,
     stage1_vectors: dict[str, np.ndarray],
     ontology_nt: Path,
+    *,
+    new_token_init: dict[str, str] | None = None,
 ) -> tuple[int, int, int]:
     """
     After ``build_vocab(..., update=True)``, overwrite new entity rows using pretrained
     class vectors. Copies ``syn1neg`` rows to match ``wv.vectors`` for new words.
+
+    If ``new_token_init`` is provided, it is filled for each vocabulary token *not* in
+    ``stage1_vectors`` with one of: ``maschine_class_mean``, ``maschine_relation_copy``,
+    ``random``.
 
     Returns:
         (n_entity_initialized, n_relation_copied, n_left_random)
@@ -170,6 +226,8 @@ def apply_maschine_initialization(
                 if model.syn1neg is not None:
                     model.syn1neg[idx] = mean.copy()
                 n_entity += 1
+                if new_token_init is not None:
+                    new_token_init[token] = "maschine_class_mean"
                 continue
 
         if inner.startswith("P_"):
@@ -181,8 +239,12 @@ def apply_maschine_initialization(
                 if model.syn1neg is not None:
                     model.syn1neg[idx] = vec.copy()
                 n_rel += 1
+                if new_token_init is not None:
+                    new_token_init[token] = "maschine_relation_copy"
                 continue
 
         n_random += 1
+        if new_token_init is not None:
+            new_token_init[token] = "random"
 
     return n_entity, n_rel, n_random
