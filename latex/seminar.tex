@@ -412,15 +412,122 @@ In order to analyze the pretrained embeddings deeper we evaluate them on DLCC te
 \end{table}
 \endgroup
 
+\section{DBpedia Graph \& Schema Construction Pipeline (DLCC Setup)}
 
+\subsection{Dataset: DBpedia Snapshot (2021-09)}
 
+The following DBpedia resources were used:
+
+\begin{itemize}
+    \item \textbf{Mapping-based object properties (cleaned)} (\textasciitilde171 MB) \\
+    Main factual graph \\
+    \texttt{mappingbased-objects\_lang=en.ttl}
+
+    \item \textbf{Instance types (specific)} (\textasciitilde42 MB) \\
+    Entity type information \\
+    \texttt{instance-types\_lang=en\_specific.ttl}
+
+    \item \textbf{DBpedia ontology (N-Triples)} (\textasciitilde5.1 MB) \\
+    Schema definition \\
+    \texttt{dbpedia\_ontology.nt}
+\end{itemize}
+
+\subsection{1. Seed Entity Extraction}
+
+Entities were collected from the DLCC DBpedia dataset across all:
+\begin{itemize}
+    \item Test cases
+    \item Domains
+    \item Dataset sizes: 50 / 500 / 5000
+\end{itemize}
+
+Processing steps:
+\begin{itemize}
+    \item Deduplication of entities
+    \item Conversion to N-Triples IRI format (\texttt{<...>})
+\end{itemize}
+
+\noindent Output: \texttt{seed\_entities.txt}
+
+\subsection{2. 2-Hop Instance Graph Construction}
+
+Using the mapping-based object properties file:
+
+\paragraph{Hop 1}
+Extract triples where:
+\begin{itemize}
+    \item subject $\in$ seed entities OR
+    \item object $\in$ seed entities
+\end{itemize}
+Output: \texttt{hop1.ttl}
+
+\paragraph{Hop 2}
+Expand using entities from Hop 1. \\
+Output: \texttt{hop2.ttl}
+
+\paragraph{Result}
+A localized 2-hop subgraph centered around DLCC entities.
+
+\subsection{3. Type Enrichment}
+
+Using the instance types (specific) file:
+
+\begin{itemize}
+    \item Extract \texttt{rdf:type} triples for all entities in the 2-hop graph
+\end{itemize}
+
+\noindent Output: \texttt{types\_hop2.ttl}
+
+\subsection{4. Final Instance Graph Construction}
+
+Merge:
+\begin{itemize}
+    \item \texttt{hop2.ttl} (factual relations)
+    \item \texttt{types\_hop2.ttl} (type information)
+\end{itemize}
+
+\noindent Output: \texttt{G.ttl} (Final Instance Graph)
+
+\subsection{5. Schema Graph Construction}
+
+Using the DBpedia ontology file:
+
+\begin{itemize}
+    \item Extract classes from \texttt{types\_hop2.ttl}
+    \item Extract properties from \texttt{G.ttl}
+    \item Expand classes via \texttt{rdfs:subClassOf} (up to 3 levels)
+\end{itemize}
+
+Retained schema relations:
+\begin{itemize}
+    \item \texttt{rdfs:subClassOf}
+    \item \texttt{rdfs:domain}
+    \item \texttt{rdfs:range}
+\end{itemize}
+
+\noindent Output: \texttt{schema.ttl}
+
+\subsection{Final Outputs}
+
+\begin{itemize}
+    \item \textbf{\texttt{G.ttl}}: 2-hop instance graph with type information
+    \item \textbf{\texttt{schema.ttl}}: filtered ontology schema graph
+\end{itemize}
+
+\subsection{Usage in RDF2Vec Experiments}
+
+\begin{itemize}
+    \item \textbf{Vanilla}: Instance graph only (\texttt{G.ttl})
+    \item \textbf{Resume Training}: Continued training on instance graph
+    \item \textbf{Schema + Resume}: Pretraining on schema graph (\texttt{schema.ttl}) followed by training on instance graph (\texttt{G.ttl})
+\end{itemize}
 
 
 
 % 
 % What would be the loss function? 
 % 
-
+bina
 \section{Problems of RDF2Vec}
 
 
