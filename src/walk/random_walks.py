@@ -107,8 +107,14 @@ def build_adjacency(
                 neighbors[s].add(o)
                 neighbors[o].add(s)
 
-    adj = {n: list(neighbors[n]) for n in tqdm(all_nodes, desc="Materializing neighbor lists", unit="node", dynamic_ncols=True, colour="cyan", mininterval=0.5)}
-    return adj, list(all_nodes)
+    # Sort neighbor lists and node order so walks are reproducible for a fixed --seed
+    # across machines/Python versions (set iteration order depends on PYTHONHASHSEED).
+    adj = {
+        n: sorted(neighbors[n])
+        for n in tqdm(all_nodes, desc="Materializing neighbor lists", unit="node", dynamic_ncols=True, colour="cyan", mininterval=0.5)
+    }
+    nodes_sorted = sorted(all_nodes)
+    return adj, nodes_sorted
 
 
 def random_walk(
@@ -232,11 +238,49 @@ def run_jrdf2vec_duplicate_free(
     threads: int,
     seed: int | None,
     token_format: str,
+    entity_roots: list[str] | None = None,
 ) -> None:
     adj = build_forward_adjacency(input_nt)
     if not adj:
         raise SystemExit("No object triples found; nothing to walk on.")
-    entities = collect_jrdf2vec_entities(adj)
+    all_entities = collect_jrdf2vec_entities(adj)
+    if entity_roots is None:
+        entities = all_entities
+    else:
+        present = set(all_entities)
+        entities = sorted({e for e in entity_roots if e in present})
+        missing = sorted({e for e in entity_roots if e not in present})
+        if missing:
+            print(
+                f"Note: {len(missing)} / {len(entity_roots)} requested entities do not appear in graph; "
+                "they will be skipped.",
+                flush=True,
+            )
+        if not entities:
+            raise SystemExit("None of the requested entities appear in the graph; nothing to walk.")
+    write_jrdf2vec_duplicate_free_walks(
+        adj,
+        entities,
+        output_walks,
+        walks_per_entity=walks_per_entity,
+        depth=depth,
+        threads=threads,
+        seed=seed,
+        token_format=token_format,
+    )
+
+
+def write_jrdf2vec_duplicate_free_walks(
+    adj_by_subject: dict[str, list[Triple]],
+    entities: list[str],
+    output_walks: Path,
+    *,
+    walks_per_entity: int,
+    depth: int,
+    threads: int,
+    seed: int | None,
+    token_format: str,
+) -> None:
     angled = token_format == "angled"
 
     def lines_for_entity(entity: str) -> list[str]:
@@ -245,7 +289,7 @@ def run_jrdf2vec_duplicate_free(
             entity,
             walks_per_entity,
             depth,
-            adj,
+            adj_by_subject,
             rng,
         )
         return [walk_triples_to_string(entity, chain, angled=angled) for chain in triple_chains]
@@ -266,16 +310,20 @@ def run_jrdf2vec_duplicate_free(
         return
 
     with output_walks.open("w", encoding="utf-8") as out, ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(lines_for_entity, e): e for e in entities}
+        future_to_entity = {pool.submit(lines_for_entity, e): e for e in entities}
+        lines_by_entity: dict[str, list[str]] = {}
         for fut in tqdm(
-            as_completed(futures),
+            as_completed(future_to_entity),
             total=len(entities),
             desc=f"jRDF2Vec duplicate-free [{n_workers} threads]",
             unit="entity",
             dynamic_ncols=True,
             colour="green",
         ):
-            for line in fut.result():
+            ent = future_to_entity[fut]
+            lines_by_entity[ent] = fut.result()
+        for ent in entities:
+            for line in lines_by_entity[ent]:
                 out.write(line + "\n")
 
 
@@ -283,6 +331,13 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Random walks on an N-Triples knowledge graph.")
     p.add_argument("input_nt", type=Path, help="Path to input .nt file")
     p.add_argument("output_walks", type=Path, help="Path to output walks file (one walk per line)")
+    p.add_argument(
+        "--entities",
+        type=Path,
+        nargs="+",
+        default=None,
+        help="Optional: one or more files listing entity URIs to use as walk roots (one URI per line).",
+    )
     p.add_argument(
         "--mode",
         choices=("classic", "jrdf2vec-duplicate-free"),
@@ -334,8 +389,26 @@ def main() -> None:
         action="store_true",
         help="(classic) Follow directed edges s→o only (default: undirected entity graph)",
     )
-    p.add_argument("--seed", type=int, default=None, help="RNG seed (classic); also seeds per-entity trim in jrdf2vec mode")
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Required for reproducible walks: fixes RNG (classic) and per-entity trim (jrdf2vec); "
+        "neighbor lists are sorted so order does not depend on PYTHONHASHSEED",
+    )
     args = p.parse_args()
+
+    entity_roots: list[str] | None = None
+    if args.entities is not None:
+        try:
+            from src.dbpedia.entities import load_entity_uris  # local import to avoid hard coupling
+        except Exception as e:  # pragma: no cover
+            raise SystemExit(f"Failed to import DBpedia entity loader: {e}") from e
+        roots = sorted(load_entity_uris(*args.entities))
+        if not roots:
+            raise SystemExit("No URIs loaded from --entities files.")
+        # Normalize: accept optional angle brackets.
+        entity_roots = [r[1:-1] if r.startswith("<") and r.endswith(">") else r for r in roots]
 
     if args.mode == "jrdf2vec-duplicate-free":
         if args.walks_per_entity < 1:
@@ -350,6 +423,7 @@ def main() -> None:
             threads=args.threads,
             seed=args.seed,
             token_format=args.token_format,
+            entity_roots=entity_roots,
         )
         return
 
@@ -362,6 +436,19 @@ def main() -> None:
     adj, nodes = build_adjacency(args.input_nt, directed=args.directed)
     if not nodes:
         raise SystemExit("No triples found; nothing to walk on.")
+
+    if entity_roots is not None:
+        present = set(nodes)
+        nodes = [n for n in entity_roots if n in present]
+        missing = [n for n in entity_roots if n not in present]
+        if missing:
+            print(
+                f"Note: {len(missing)} / {len(entity_roots)} requested entities do not appear in graph; "
+                "they will be skipped.",
+                flush=True,
+            )
+        if not nodes:
+            raise SystemExit("None of the requested entities appear in the graph; nothing to walk.")
 
     args.output_walks.parent.mkdir(parents=True, exist_ok=True)
     mode = "directed" if args.directed else "undirected"

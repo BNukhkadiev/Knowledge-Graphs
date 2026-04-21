@@ -3,13 +3,14 @@ MASCHInE-style transfer of protograph (P2) embeddings to instance RDF2Vec vocabu
 (Hubert et al., arXiv:2306.03659, Section 3.2).
 
 Builds entity → most-specific class mapping from ontology, then initializes new
-Word2Vec rows from pretrained class vectors (mean if multiple).
+Word2Vec rows from pretrained class vectors. Strategies: most-specific only (default),
+unweighted mean over the full superclass closure, or distance-decayed mean toward roots.
 """
 
 from __future__ import annotations
 
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +44,92 @@ RDF_PROPERTY_TYPE_IRIS: frozenset[str] = frozenset(
 
 # Synthetic DLCC-style extra individuals: EXTRA_I_FOR_CLASS_C_tc07_152_640 -> C_tc07_152
 EXTRA_CLASS_RE = re.compile(r"^EXTRA_I_FOR_CLASS_(C_tc07_\d+)_")
+
+MASCHINE_CLASS_INIT_STRATEGIES = frozenset(
+    {"most_specific", "ancestor_mean", "ancestor_weighted"},
+)
+
+
+def min_hops_upward_from_roots(
+    roots: list[str],
+    parents: dict[str, set[str]],
+) -> dict[str, int]:
+    """For each class reachable via ``rdfs:subClassOf`` upward from ``roots``, shortest hop count from the nearest root."""
+    if not roots:
+        return {}
+    dist: dict[str, int] = {}
+    q: deque[str] = deque()
+    for r in roots:
+        if r not in dist:
+            dist[r] = 0
+            q.append(r)
+    while q:
+        u = q.popleft()
+        du = dist[u]
+        for par in parents.get(u, ()):
+            nd = du + 1
+            if par not in dist or nd < dist[par]:
+                dist[par] = nd
+                q.append(par)
+    return dist
+
+
+def init_vector_from_class_roots(
+    roots_inner: list[str],
+    parents: dict[str, set[str]],
+    stage1_vectors: dict[str, np.ndarray],
+    *,
+    strategy: str,
+    ancestor_decay: float = 0.5,
+) -> np.ndarray | None:
+    """
+    Combine pretrained class vectors for initializing an instance row.
+
+    * ``most_specific`` — mean of vectors for ``roots_inner`` (after MASCHInE filtering).
+    * ``ancestor_mean`` — mean over ``roots_inner`` and all transitive superclasses.
+    * ``ancestor_weighted`` — weighted mean over that same closure with weight ``ancestor_decay**d``,
+      where ``d`` is hop distance upward from the nearest root.
+    """
+    if strategy not in MASCHINE_CLASS_INIT_STRATEGIES:
+        raise ValueError(f"unknown strategy {strategy!r}; expected one of {sorted(MASCHINE_CLASS_INIT_STRATEGIES)}")
+    if not roots_inner:
+        return None
+    if strategy == "most_specific":
+        tokens = [nt_term(r) for r in roots_inner]
+        parts = [stage1_vectors[t] for t in tokens if t in stage1_vectors]
+        if not parts:
+            return None
+        return np.mean(parts, axis=0).astype(np.float32, copy=False)
+
+    closure = min_hops_upward_from_roots(roots_inner, parents)
+    if not closure:
+        return None
+    if strategy == "ancestor_mean":
+        parts = [stage1_vectors[nt_term(c_inner)] for c_inner in closure if nt_term(c_inner) in stage1_vectors]
+        if not parts:
+            return None
+        return np.mean(parts, axis=0).astype(np.float32, copy=False)
+
+    if strategy == "ancestor_weighted":
+        if not (0.0 < ancestor_decay <= 1.0):
+            raise ValueError("ancestor_weighted requires 0 < --maschine-ancestor-decay <= 1")
+        w_accum = 0.0
+        vec_accum: np.ndarray | None = None
+        for c_inner, d in closure.items():
+            tok = nt_term(c_inner)
+            if tok not in stage1_vectors:
+                continue
+            w = ancestor_decay**d
+            v = stage1_vectors[tok]
+            if vec_accum is None:
+                vec_accum = (w * v).astype(np.float32, copy=False)
+            else:
+                vec_accum = vec_accum + w * v
+            w_accum += w
+        if vec_accum is None or w_accum <= 0.0:
+            return None
+        return (vec_accum / w_accum).astype(np.float32, copy=False)
+    return None
 
 
 def _ancestors_generalizations(node: str, parents: dict[str, set[str]]) -> set[str]:
@@ -178,26 +265,77 @@ def token_is_instance_entity(token: str) -> bool:
     return False
 
 
+def transfer_predicate_embeddings_from_pretrained(
+    model: Word2Vec,
+    stage1_vectors: dict[str, np.ndarray],
+    *,
+    new_token_init: dict[str, str] | None = None,
+) -> int:
+    """
+    For each vocabulary token not present in ``stage1_vectors`` whose inner IRI starts with
+    ``P_`` (DLCC relation/predicate walks), copy the pretrained row if that token existed in stage 1.
+
+    Use when MASCHInE class init is disabled but RDF2Vec should still reuse relation vectors
+    from protograph pretraining. Idempotent for rows already matching ``stage1_vectors``.
+
+    Returns the number of predicate rows overwritten.
+    """
+    wv = model.wv
+    n = 0
+    for token in wv.index_to_key:
+        if token in stage1_vectors:
+            continue
+        inner = token[1:-1] if len(token) >= 2 and token[0] == "<" else token
+        if not inner.startswith("P_"):
+            continue
+        tok = nt_term(inner)
+        if tok not in stage1_vectors:
+            continue
+        vec = stage1_vectors[tok]
+        idx = wv.key_to_index[token]
+        wv.vectors[idx] = vec.copy()
+        if model.syn1neg is not None:
+            model.syn1neg[idx] = vec.copy()
+        n += 1
+        if new_token_init is not None:
+            new_token_init[token] = "predicate_transfer"
+    return n
+
+
 def apply_maschine_initialization(
     model: Word2Vec,
     stage1_vectors: dict[str, np.ndarray],
     ontology_nt: Path,
     *,
+    strategy: str = "most_specific",
+    ancestor_decay: float = 0.5,
     new_token_init: dict[str, str] | None = None,
 ) -> tuple[int, int, int]:
     """
     After ``build_vocab(..., update=True)``, overwrite new entity rows using pretrained
     class vectors. Copies ``syn1neg`` rows to match ``wv.vectors`` for new words.
 
+    ``strategy`` selects how class vectors are combined (see ``init_vector_from_class_roots``).
+
     If ``new_token_init`` is provided, it is filled for each vocabulary token *not* in
-    ``stage1_vectors`` with one of: ``maschine_class_mean``, ``maschine_relation_copy``,
-    ``random``.
+    ``stage1_vectors`` with one of: ``maschine_class_mean``, ``maschine_ancestor_mean``,
+    ``maschine_ancestor_weighted``, ``maschine_relation_copy``, ``random``.
 
     Returns:
         (n_entity_initialized, n_relation_copied, n_left_random)
     """
+    if strategy not in MASCHINE_CLASS_INIT_STRATEGIES:
+        raise ValueError(f"unknown strategy {strategy!r}; expected one of {sorted(MASCHINE_CLASS_INIT_STRATEGIES)}")
+
     parents, entity_types = load_ontology_mapping(ontology_nt)
     ent_to_classes = build_entity_to_class_tokens(parents, entity_types)
+
+    init_labels = {
+        "most_specific": "maschine_class_mean",
+        "ancestor_mean": "maschine_ancestor_mean",
+        "ancestor_weighted": "maschine_ancestor_weighted",
+    }
+    init_label = init_labels[strategy]
 
     wv = model.wv
     n_entity = 0
@@ -217,18 +355,29 @@ def apply_maschine_initialization(
                 mst = _most_specific_types({c}, parents)
                 class_tokens = [nt_term(x) for x in mst]
 
+        roots_inner: list[str] = []
         if class_tokens:
-            parts = [stage1_vectors[t] for t in class_tokens if t in stage1_vectors]
-            if parts:
-                mean = np.mean(parts, axis=0).astype(np.float32, copy=False)
-                idx = wv.key_to_index[token]
-                wv.vectors[idx] = mean
-                if model.syn1neg is not None:
-                    model.syn1neg[idx] = mean.copy()
-                n_entity += 1
-                if new_token_init is not None:
-                    new_token_init[token] = "maschine_class_mean"
-                continue
+            roots_inner = [t[1:-1] for t in class_tokens if len(t) >= 2 and t[0] == "<" and t[-1] == ">"]
+
+        init_vec: np.ndarray | None = None
+        if roots_inner:
+            init_vec = init_vector_from_class_roots(
+                roots_inner,
+                parents,
+                stage1_vectors,
+                strategy=strategy,
+                ancestor_decay=ancestor_decay,
+            )
+
+        if init_vec is not None:
+            idx = wv.key_to_index[token]
+            wv.vectors[idx] = init_vec
+            if model.syn1neg is not None:
+                model.syn1neg[idx] = init_vec.copy()
+            n_entity += 1
+            if new_token_init is not None:
+                new_token_init[token] = init_label
+            continue
 
         if inner.startswith("P_"):
             tok = nt_term(inner)

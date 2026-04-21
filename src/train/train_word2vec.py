@@ -6,14 +6,20 @@ Modes (--mode):
   none — Train on a single walks file (default).
   p1, p2 — Two-stage RDF2Vec: pretrain on protograph P1 or P2 walks, then finetune on
            instance walks from a file you supply (MASCHInE-style init when an ontology is available).
+           Class-vector aggregation is configurable (--maschine-strategy).
 
 Input: one space-separated walk per line.
 
 Single-corpus mode logs per-epoch loss, CSV, PNG, optional per-step loss (--loss-every-steps).
 p1/p2 mode writes pretrain_per_epoch.png and protograph_per_epoch.png; per-step PNGs use
 --loss-every-steps-pretrain / --loss-every-steps-finetune (or --loss-every-steps N for both).
+Without MASCHInE, optional predicate embedding transfer from stage 1 uses --transfer-predicate-embeddings (default on).
 Writes instance_to_class.json (default): ``{ instance_iri_inner: [ class_iri_inner, ... ] }`` from ontology.nt.
 Saves a .pt checkpoint compatible with evaluate_embeddings.py (embeddings + word2idx).
+
+Reproducibility: pass ``--seed``; training then uses ``workers=1`` (Gensim's multi-worker
+path is not bit-identical). ``PYTHONHASHSEED`` is fixed only if set in the environment
+before starting the interpreter.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import csv
 import json
 import logging
 import os
+import random
 import sys
 from pathlib import Path
 
@@ -37,11 +44,35 @@ from gensim.models.callbacks import CallbackAny2Vec
 from gensim.models.word2vec import LineSentence
 from tqdm.auto import tqdm
 
-from src.protograph.maschine_init import apply_maschine_initialization, instance_class_mapping_from_ontology
+from src.protograph.maschine_init import (
+    apply_maschine_initialization,
+    instance_class_mapping_from_ontology,
+    transfer_predicate_embeddings_from_pretrained,
+)
 
 
 def _workers_effective(workers: int) -> int:
     return workers if workers > 0 else (os.cpu_count() or 1)
+
+
+def _set_training_rng(seed: int) -> None:
+    """Seed stdlib, NumPy, and PyTorch RNGs (Gensim Word2Vec uses NumPy for sampling)."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def _effective_workers_for_reproducibility(seed: int | None, workers: int, *, label: str) -> int:
+    """Return worker count. When ``seed`` is set, force ``workers=1`` (Gensim multi-worker SGD is nondeterministic)."""
+    w = workers
+    if seed is not None and w > 1:
+        print(
+            f"Note: --seed set: using workers=1 for {label} (Gensim Word2Vec is nondeterministic with workers>1).",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+    return w
 
 
 class Word2VecWithStepLoss(Word2Vec):
@@ -256,13 +287,13 @@ def save_instance_to_class_json(path: Path, ontology_path: Path | None) -> None:
         f.write("\n")
 
 
-def build_gensim_to_pt(model: Word2Vec) -> dict:
+def build_gensim_to_pt(model: Word2Vec, *, training_seed: int | None = None) -> dict:
     """Checkpoint dict compatible with evaluate_embeddings.py / train_word2vec.py."""
     wv = model.wv
     emb = torch.from_numpy(wv.vectors.copy())
     idx2word = list(wv.index_to_key)
     word2idx = {w: i for i, w in enumerate(idx2word)}
-    return {
+    out: dict = {
         "embeddings": emb,
         "word2idx": word2idx,
         "idx2word": idx2word,
@@ -273,11 +304,9 @@ def build_gensim_to_pt(model: Word2Vec) -> dict:
         "trainer": "gensim",
         "gensim_version": __import__("gensim").__version__,
     }
-
-
-def count_lines(path: Path) -> int:
-    with path.open(encoding="utf-8") as f:
-        return sum(1 for _ in f)
+    if training_seed is not None:
+        out["training_seed"] = int(training_seed)
+    return out
 
 
 def train_word2vec_stage(
@@ -317,7 +346,7 @@ def train_word2vec_stage(
         step_loss_quiet=step_loss_quiet,
         **kw,
     )
-    model.build_vocab(sentences)
+    model.build_vocab(sentences, progress_per=10000)
     cb = EpochLossProgress(total_epochs=epochs, desc=desc)
     callbacks: list[CallbackAny2Vec] = [cb]
     if step_loss_interval > 0:
@@ -338,6 +367,14 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
     """Pretrain on P1 or P2 protograph walks, then finetune on instance walks (``--mode p1`` / ``p2``)."""
     mode = args.mode
     assert mode in ("p1", "p2")
+
+    if args.seed is not None:
+        _set_training_rng(int(args.seed))
+
+    if args.maschine_strategy == "ancestor_weighted" and not (0.0 < args.maschine_ancestor_decay <= 1.0):
+        raise SystemExit(
+            "--maschine-ancestor-decay must satisfy 0 < R <= 1 when using --maschine-strategy ancestor_weighted."
+        )
 
     if args.pretrain_walks is None:
         args.pretrain_walks = Path("walks_p1.txt") if mode == "p1" else Path("walks_p2.txt")
@@ -387,6 +424,9 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
                 )
         else:
             pre_workers = _workers_effective(args.workers)
+        pre_workers = _effective_workers_for_reproducibility(
+            args.seed, pre_workers, label="stage 1 (pretrain)"
+        )
         pre_lr = args.pretrain_lr if args.pretrain_lr is not None else args.lr
         pre_min_alpha = args.pretrain_min_alpha if args.pretrain_min_alpha is not None else args.min_alpha
         pre_model, pretrain_losses = train_word2vec_stage(
@@ -423,8 +463,7 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
     if not instance_path.is_file():
         raise SystemExit(f"Instance walks not found: {instance_path}")
 
-    n_inst = count_lines(instance_path)
-    print(f"Stage 2: continuing training on {instance_path} ({n_inst} lines) ...")
+    print(f"Stage 2: building vocabulary from instance walks {instance_path} ...", flush=True)
 
     ontology_path = args.ontology
     if ontology_path is None:
@@ -435,7 +474,9 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
     stage1_vectors = {
         w: np.asarray(pre_model.wv[w], dtype=np.float32).copy() for w in pre_model.wv.index_to_key
     }
-    pre_model.build_vocab(LineSentence(str(instance_path)), update=True)
+    pre_model.build_vocab(LineSentence(str(instance_path)), update=True, progress_per=10000)
+    n_inst = int(pre_model.corpus_count)
+    print(f"Stage 2: continuing training on {instance_path} ({n_inst} sentences) ...", flush=True)
 
     new_token_init: dict[str, str] = {}
     maschine_applied = False
@@ -445,10 +486,12 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
             pre_model,
             stage1_vectors,
             ontology_path,
+            strategy=args.maschine_strategy,
+            ancestor_decay=args.maschine_ancestor_decay,
             new_token_init=new_token_init,
         )
         print(
-            f"MASCHInE init: entity rows from class vectors={n_ent}, "
+            f"MASCHInE init ({args.maschine_strategy}): entity rows from class vectors={n_ent}, "
             f"relation rows copied from pretrain={n_rel}, left random={n_rand}"
         )
     elif args.maschine_init and (ontology_path is None or not ontology_path.is_file()):
@@ -456,9 +499,23 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
             "MASCHInE init skipped (no ontology.nt); pass --ontology or place ontology.nt beside instance walks"
         )
 
+    n_pred_transfer = 0
+    if not maschine_applied and args.transfer_predicate_embeddings:
+        n_pred_transfer = transfer_predicate_embeddings_from_pretrained(
+            pre_model,
+            stage1_vectors,
+            new_token_init=new_token_init,
+        )
+        if n_pred_transfer:
+            print(
+                f"Transferred predicate embeddings from pretrain (rows updated={n_pred_transfer}); "
+                "use --no-transfer-predicate-embeddings to disable.",
+                flush=True,
+            )
+
     if not maschine_applied:
         for w in pre_model.wv.index_to_key:
-            if w not in stage1_vectors:
+            if w not in stage1_vectors and w not in new_token_init:
                 new_token_init[w] = "gensim_default"
 
     if not args.no_pretrain_init_mapping:
@@ -479,6 +536,9 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
             flush=True,
         )
     ft_workers = 1 if finetune_loss_every > 0 else _workers_effective(args.workers)
+    ft_workers = _effective_workers_for_reproducibility(
+        args.seed, ft_workers, label="stage 2 (finetune)"
+    )
     pre_model.workers = ft_workers
 
     # Finetune uses --lr / --min-alpha (independent of stage-1 pretrain-lr / pretrain-min-alpha).
@@ -614,7 +674,7 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
 
-    ckpt = build_gensim_to_pt(pre_model)
+    ckpt = build_gensim_to_pt(pre_model, training_seed=args.seed)
     ckpt["trainer"] = "rdf2vec_train"
     final_pt_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(ckpt, final_pt_path)
@@ -627,6 +687,9 @@ def run_single_corpus_mode(args: argparse.Namespace) -> None:
         raise SystemExit("Walks file required when --mode is none.")
     if not args.walks.is_file():
         raise SystemExit(f"Walks file not found: {args.walks}")
+
+    if args.seed is not None:
+        _set_training_rng(int(args.seed))
 
     if args.gensim_log_progress:
         logging.basicConfig(
@@ -642,6 +705,8 @@ def run_single_corpus_mode(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
         workers = 1
+
+    workers = _effective_workers_for_reproducibility(args.seed, workers, label="single-corpus training")
 
     sentences = LineSentence(str(args.walks))
 
@@ -740,7 +805,7 @@ def run_single_corpus_mode(args: argparse.Namespace) -> None:
         )
         tqdm.write(f"Wrote loss plot: {loss_plot}")
 
-    ckpt = build_gensim_to_pt(model)
+    ckpt = build_gensim_to_pt(model, training_seed=args.seed)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(ckpt, args.output)
     tqdm.write(
@@ -815,7 +880,13 @@ def main() -> None:
         default=0,
         help="Gensim worker threads (0 = all cores; single-corpus mode). For --mode p1/p2, stage 1/2 training.",
     )
-    p.add_argument("--seed", type=int, default=None, help="Random seed")
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed (sets Python/NumPy/torch RNGs; with Gensim, use this for reproducible runs — "
+        "when set, training uses workers=1 because multi-threaded Word2Vec updates are nondeterministic).",
+    )
     p.add_argument(
         "--loss-log",
         type=Path,
@@ -855,10 +926,10 @@ def main() -> None:
     p.add_argument(
         "--loss-every-steps-pretrain",
         type=int,
-        default=1,
+        default=0,
         metavar="N",
-        help="p1/p2 stage 1: log step loss every N batch jobs (default 1; use 0 to disable). "
-        "Ignored when --loss-every-steps > 0.",
+        help="p1/p2 stage 1: log step loss every N batch jobs (default 0 = epoch bar only; N>0 forces "
+        "workers=1 and slows pretrain). Ignored when --loss-every-steps > 0.",
     )
     p.add_argument(
         "--loss-every-steps-finetune",
@@ -926,6 +997,38 @@ def main() -> None:
         dest="maschine_init",
         action="store_false",
         help="Skip MASCHInE init; keep gensim random init for new vocabulary after build_vocab(update=True).",
+    )
+    p.add_argument(
+        "--transfer-predicate-embeddings",
+        dest="transfer_predicate_embeddings",
+        action="store_true",
+        default=True,
+        help="(--mode p1/p2) When MASCHInE is off, copy stage-1 vectors for new relation/P_ walk tokens. "
+        "When MASCHInE is on, relation rows are already copied there; this flag is ignored.",
+    )
+    p.add_argument(
+        "--no-transfer-predicate-embeddings",
+        dest="transfer_predicate_embeddings",
+        action="store_false",
+        help="(--mode p1/p2) Do not copy pretrained predicate rows when MASCHInE init is disabled.",
+    )
+    p.add_argument(
+        "--maschine-strategy",
+        type=str,
+        default="most_specific",
+        choices=("most_specific", "ancestor_mean", "ancestor_weighted"),
+        help="How to combine protograph class embeddings for new instance rows: "
+        "most_specific (default), unweighted mean over asserted type(s) plus all superclasses (ancestor_mean), "
+        "or distance-decayed mean toward roots (ancestor_weighted; see --maschine-ancestor-decay).",
+    )
+    p.add_argument(
+        "--maschine-ancestor-decay",
+        type=float,
+        default=0.5,
+        metavar="R",
+        help="For --maschine-strategy ancestor_weighted: per-hop multiplier so weight ∝ R**distance "
+        "(smaller R emphasizes types closer to the asserted most-specific class). Ignored otherwise. "
+        "Required: 0 < R ≤ 1.",
     )
     p.add_argument(
         "--loss-pretrain-epoch-plot",

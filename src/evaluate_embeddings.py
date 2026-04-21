@@ -216,6 +216,12 @@ def main() -> None:
         default=2048,
         help="Rows per progress chunk when building embedding matrices",
     )
+    p.add_argument(
+        "--label",
+        type=str,
+        default=None,
+        help="Printed before the metrics table (e.g. TC + strategy) so batch logs stay readable.",
+    )
     args = p.parse_args()
 
     train_path = args.train if args.train is not None else default_train_path(args.test)
@@ -267,6 +273,10 @@ def main() -> None:
     results = bootstrap_metrics(y_test, y_pred, args.bootstrap, args.seed)
 
     print()
+    if args.label:
+        print("─" * 52)
+        print(args.label)
+        print("─" * 52)
     print("─" * 52)
     print("Test metrics (binary classification, positive class = 1)")
     print("─" * 52)

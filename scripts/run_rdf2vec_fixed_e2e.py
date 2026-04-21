@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -201,19 +202,37 @@ def _config_fingerprint(cfg: dict[str, Any]) -> str:
 
 
 def _run_capture_log(cmd: list[str], log: TextIO) -> None:
+    """
+    Stream child stdout to the log file and the terminal.
+
+    ``subprocess.run(..., stdout=PIPE)`` only reads when the process exits; enough
+    trainer output can fill the pipe and deadlock the child.
+    """
     print("+", " ".join(cmd), flush=True)
-    proc = subprocess.run(
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    proc = subprocess.Popen(
         cmd,
         cwd=REPO_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=env,
     )
-    log.write(proc.stdout)
-    log.flush()
-    print(proc.stdout, end="", flush=True)
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    assert proc.stdout is not None
+    try:
+        while True:
+            chunk = proc.stdout.read(8192)
+            if not chunk:
+                break
+            log.write(chunk)
+            log.flush()
+            print(chunk, end="", flush=True)
+    finally:
+        proc.stdout.close()
+    rc = proc.wait()
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, cmd)
 
 
 def main() -> None:

@@ -66,7 +66,8 @@ echo "== 2/5 Random walks on P1 → ${WALKS_P1}"
 uv run src/walk/random_walks.py "${PROT_P1_NT}" "${WALKS_P1}" \
   --mode "jrdf2vec-duplicate-free" \
   --depth 4 \
-  --walks-per-entity 100
+  --walks-per-entity 100 \
+  --seed 42
 
 if [[ -n "${PRECOMPUTED_INSTANCE_WALKS:-}" ]]; then
   echo "== 3/5 Skip instance walks (PRECOMPUTED_INSTANCE_WALKS=${WALKS_INSTANCE})"
