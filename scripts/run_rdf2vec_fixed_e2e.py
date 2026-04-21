@@ -94,6 +94,11 @@ def _w2v_none_argv(cfg: dict[str, Any], walks: Path, checkpoint: Path) -> list[s
     rs = w.get("random_seed")
     if rs is not None:
         cmd.extend(["--seed", str(int(rs))])
+    workers_cfg = w.get("workers")
+    if workers_cfg is not None:
+        cmd.extend(["--workers", str(int(workers_cfg))])
+    if w.get("allow_nondeterministic_workers"):
+        cmd.append("--allow-nondeterministic-workers")
     if loss_steps > 0:
         cmd.extend(["--loss-every-steps", str(loss_steps)])
     return cmd
@@ -115,8 +120,8 @@ def _w2v_p1_p2_argv(
     ep = int(w["epochs"])
     pretrain_epochs = int(pre_e if pre_e is not None else ep)
     finetune_epochs = int(ft_e if ft_e is not None else ep)
-    l_pre = int(w.get("loss_every_steps_pretrain") or 1)
-    l_ft = int(w.get("loss_every_steps_finetune") or 0)
+    l_pre = int(w["loss_every_steps_pretrain"]) if "loss_every_steps_pretrain" in w else 1
+    l_ft = int(w["loss_every_steps_finetune"]) if "loss_every_steps_finetune" in w else 0
     l_both = int(w.get("loss_every_steps") or 0)
 
     cmd: list[str] = [
@@ -157,6 +162,11 @@ def _w2v_p1_p2_argv(
     rs = w.get("random_seed")
     if rs is not None:
         cmd.extend(["--seed", str(int(rs))])
+    workers_cfg = w.get("workers")
+    if workers_cfg is not None:
+        cmd.extend(["--workers", str(int(workers_cfg))])
+    if w.get("allow_nondeterministic_workers"):
+        cmd.append("--allow-nondeterministic-workers")
     if l_both > 0:
         cmd.extend(["--loss-every-steps", str(l_both)])
     else:

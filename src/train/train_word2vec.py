@@ -17,9 +17,9 @@ Without MASCHInE, optional predicate embedding transfer from stage 1 uses --tran
 Writes instance_to_class.json (default): ``{ instance_iri_inner: [ class_iri_inner, ... ] }`` from the ontology file (.nt or .ttl).
 Saves a .pt checkpoint compatible with evaluate_embeddings.py (embeddings + word2idx).
 
-Reproducibility: pass ``--seed``; training then uses ``workers=1`` (Gensim's multi-worker
-path is not bit-identical). ``PYTHONHASHSEED`` is fixed only if set in the environment
-before starting the interpreter.
+Reproducibility: pass ``--seed``; by default training uses ``workers=1`` (Gensim's multi-worker
+path is not bit-identical). Use ``--allow-nondeterministic-workers`` for speed when exact replay is not needed.
+``PYTHONHASHSEED`` is fixed only if set in the environment before starting the interpreter.
 """
 
 from __future__ import annotations
@@ -62,8 +62,20 @@ def _set_training_rng(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def _effective_workers_for_reproducibility(seed: int | None, workers: int, *, label: str) -> int:
-    """Return worker count. When ``seed`` is set, force ``workers=1`` (Gensim multi-worker SGD is nondeterministic)."""
+def _effective_workers_for_reproducibility(
+    seed: int | None,
+    workers: int,
+    *,
+    label: str,
+    allow_nondeterministic_workers: bool = False,
+) -> int:
+    """Return worker count.
+
+    When ``seed`` is set, force ``workers=1`` unless ``allow_nondeterministic_workers`` is true
+    (Gensim multi-worker SGD is nondeterministic across runs).
+    """
+    if allow_nondeterministic_workers:
+        return workers
     w = workers
     if seed is not None and w > 1:
         print(
@@ -425,7 +437,10 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
         else:
             pre_workers = _workers_effective(args.workers)
         pre_workers = _effective_workers_for_reproducibility(
-            args.seed, pre_workers, label="stage 1 (pretrain)"
+            args.seed,
+            pre_workers,
+            label="stage 1 (pretrain)",
+            allow_nondeterministic_workers=args.allow_nondeterministic_workers,
         )
         pre_lr = args.pretrain_lr if args.pretrain_lr is not None else args.lr
         pre_min_alpha = args.pretrain_min_alpha if args.pretrain_min_alpha is not None else args.min_alpha
@@ -540,7 +555,10 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
         )
     ft_workers = 1 if finetune_loss_every > 0 else _workers_effective(args.workers)
     ft_workers = _effective_workers_for_reproducibility(
-        args.seed, ft_workers, label="stage 2 (finetune)"
+        args.seed,
+        ft_workers,
+        label="stage 2 (finetune)",
+        allow_nondeterministic_workers=args.allow_nondeterministic_workers,
     )
     pre_model.workers = ft_workers
 
@@ -709,7 +727,12 @@ def run_single_corpus_mode(args: argparse.Namespace) -> None:
             )
         workers = 1
 
-    workers = _effective_workers_for_reproducibility(args.seed, workers, label="single-corpus training")
+    workers = _effective_workers_for_reproducibility(
+        args.seed,
+        workers,
+        label="single-corpus training",
+        allow_nondeterministic_workers=args.allow_nondeterministic_workers,
+    )
 
     sentences = LineSentence(str(args.walks))
 
@@ -884,11 +907,17 @@ def main() -> None:
         help="Gensim worker threads (0 = all cores; single-corpus mode). For --mode p1/p2, stage 1/2 training.",
     )
     p.add_argument(
+        "--allow-nondeterministic-workers",
+        action="store_true",
+        help="Allow workers>1 even when --seed is set (faster but Gensim SGD order is nondeterministic). "
+        "Per-step loss logging still forces workers=1.",
+    )
+    p.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Random seed (sets Python/NumPy/torch RNGs; with Gensim, use this for reproducible runs — "
-        "when set, training uses workers=1 because multi-threaded Word2Vec updates are nondeterministic).",
+        help="Random seed (sets Python/NumPy/torch RNGs). When set, training defaults to workers=1 "
+        "(multi-threaded Word2Vec is nondeterministic) unless --allow-nondeterministic-workers.",
     )
     p.add_argument(
         "--loss-log",
