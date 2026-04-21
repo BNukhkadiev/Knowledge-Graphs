@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 from gensim.models import Word2Vec
 
-from src.protograph.protograph_gen import iter_nt_iris
+from src.protograph.protograph_gen import iter_rdf_iris
 from src.walk.random_walks import nt_term
 
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
@@ -184,7 +184,7 @@ def load_ontology_mapping(ontology_nt: Path) -> tuple[dict[str, set[str]], dict[
     parents: dict[str, set[str]] = defaultdict(set)
     raw_types: dict[str, set[str]] = defaultdict(set)
 
-    for s, p, o in iter_nt_iris(ontology_nt):
+    for s, p, o in iter_rdf_iris(ontology_nt):
         if p == RDFS_SUBCLASS:
             parents[s].add(o)
             continue

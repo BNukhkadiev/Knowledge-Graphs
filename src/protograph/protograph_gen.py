@@ -46,6 +46,42 @@ def iter_nt_iris(path: Path) -> Iterable[tuple[str, str, str]]:
             yield m.group(1), m.group(2), m.group(3)
 
 
+def iter_rdf_iris(path: Path) -> Iterable[tuple[str, str, str]]:
+    """
+    Yield (s, p, o) for triples where all terms are IRIs (no blank nodes, no literals).
+
+    Supported inputs:
+      - `.nt`  (fast regex-based scan; same behavior as before)
+      - `.ttl` / `.turtle` (parsed with RDFLib)
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".nt":
+        yield from iter_nt_iris(path)
+        return
+
+    if suffix in {".ttl", ".turtle"}:
+        try:
+            import rdflib  # type: ignore
+            from rdflib.term import BNode, Literal, URIRef  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(
+                "Reading Turtle (.ttl) requires rdflib. "
+                "Install dependencies (e.g. `uv sync`) or add rdflib to your environment."
+            ) from e
+
+        g = rdflib.Graph()
+        g.parse(path.as_posix(), format="turtle")
+        for s, p, o in g:
+            if isinstance(s, URIRef) and isinstance(p, URIRef) and isinstance(o, URIRef):
+                yield str(s), str(p), str(o)
+            else:
+                # Skip bnodes and literals (protograph generation assumes IRI-IRI-IRI).
+                continue
+        return
+
+    raise ValueError(f"Unsupported schema/KG format for {path.name!r}. Expected .nt or .ttl.")
+
+
 def load_schema(
     path: Path,
     *,
@@ -68,7 +104,7 @@ def load_schema(
     # parent -> set of direct child classes
     children: dict[str, set[str]] = defaultdict(set)
 
-    for s, p, o in iter_nt_iris(path):
+    for s, p, o in iter_rdf_iris(path):
         if p == RDFS_SUBCLASS:
             # s subclassOf o  => o is superclass, s is direct subclass
             children[o].add(s)
@@ -192,9 +228,9 @@ def triples_to_nt_lines(triples: set[tuple[str, str, str]]) -> list[str]:
 
 
 def relations_in_kg(kg_path: Path) -> set[str]:
-    """Collect predicate IRIs appearing in an N-Triples KG (schema may be separate)."""
+    """Collect predicate IRIs appearing in a KG (.nt or .ttl) to filter schema relations."""
     preds: set[str] = set()
-    for s, p, o in iter_nt_iris(kg_path):
+    for _s, p, _o in iter_rdf_iris(kg_path):
         preds.add(p)
     return preds
 
@@ -205,13 +241,13 @@ def main() -> None:
         "--schema",
         type=Path,
         required=True,
-        help="N-Triples file with rdfs:domain, rdfs:range, rdfs:subClassOf (IRI triples).",
+        help="Schema file (.nt or .ttl) with rdfs:domain, rdfs:range, rdfs:subClassOf (IRI triples).",
     )
     ap.add_argument(
         "--kg",
         type=Path,
         default=None,
-        help="Optional N-Triples KG: only relations whose IRIs appear as predicates here are used.",
+        help="Optional KG (.nt or .ttl): only relations whose IRIs appear as predicates here are used.",
     )
     ap.add_argument(
         "--out-dir",
