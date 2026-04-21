@@ -185,13 +185,25 @@ uv run src/walk/random_walks.py protograph_p2.nt walks_p2.txt \
   --walks-per-entity 100
 ```
 
-### 3. Two-stage training (`--mode p1` or `p2`)
+### 3. Instance walks (stage 2 corpus)
+
+Generate duplicate-free walks on the instance graph (same knobs as protograph walks):
 
 ```bash
-uv run src/train/train_word2vec.py \
+uv run src/walk/random_walks.py v1/synthetic_ontology/tc07/synthetic_ontology/graph.nt walks_instance.txt \
+  --mode jrdf2vec-duplicate-free \
+  --depth 4 \
+  --walks-per-entity 100 \
+  --threads 8 \
+  --seed 42
+```
+
+### 4. Two-stage training (`--mode p1` or `p2`)
+
+```bash
+uv run src/train/train_word2vec.py walks_instance.txt \
   --mode p2 \
   --pretrain-walks walks_p2.txt \
-  --graph v1/synthetic_ontology/tc07/synthetic_ontology/graph.nt \
   --ontology v1/synthetic_ontology/tc07/synthetic_ontology/ontology.nt \
   --out-dir output/tc07_rdf2vec_proto \
   -o rdf2vec_final.pt \
@@ -203,34 +215,25 @@ uv run src/train/train_word2vec.py \
   --lr 0.025 \
   --pretrain-epochs 5 \
   --finetune-epochs 5 \
-  --walks-per-entity 100 \
-  --depth 4 \
-  --walk-threads 8 \
-  --walk-seed 42 \
   --loss-every-steps 0 \
   --maschine-init
 ```
 
-**Stage 2 walks** come from either:
-
-- `--instance-walks path.txt` — use an existing file, or  
-- `--graph instance.nt` — generate jRDF2Vec duplicate-free walks to `--instance-walks-out` (default `walks_tc07_instance.txt` under `--out-dir`).
+**Stage 2 walks** are the **positional `walks` argument** (or `--instance-walks`): a text file produced by `random_walks.py` on your instance `.nt`.
 
 | Argument | Default | Meaning |
 |----------|---------|---------|
+| `walks` | — | Stage-2 instance walks file (`--instance-walks` overrides) |
 | `--mode` | — | `p1` or `p2` |
 | `--pretrain-walks` | `walks_p1.txt` / `walks_p2.txt` | Stage-1 corpus |
-| `--graph` | none | Instance `.nt` for generating stage-2 walks |
-| `--instance-walks` | none | Explicit stage-2 walks (positional `walks` also sets this) |
-| `--instance-walks-out` | `walks_tc07_instance.txt` | Output path when generating from `--graph` |
+| `--instance-walks` | none | Stage-2 walks (defaults to positional `walks`) |
 | `--out-dir` | `.` | Artifacts: `rdf2vec_pretrained.model`, plots, walk outputs |
 | `-o`, `--output` | `rdf2vec_final.pt` | Final `.pt` (relative paths resolve under `--out-dir`) |
 | `--pretrain-epochs` | `5` | Stage 1 epochs |
 | `--finetune-epochs` | `5` | Stage 2 epochs |
 | `--skip-pretrain` | off | Load `rdf2vec_pretrained.model` from `--out-dir` instead of training stage 1 |
-| `--ontology` | auto next to `--graph` | For MASCHInE init (`rdf:type`, `rdfs:subClassOf`) |
+| `--ontology` | none | For MASCHInE init (`rdf:type`, `rdfs:subClassOf`); else `ontology.nt` beside instance walks if present |
 | `--maschine-init` / `--no-maschine-init` | on | Initialize new instance tokens from class vectors when ontology is available |
-| `--walks-per-entity`, `--depth`, `--walk-threads`, `--walk-seed` | see defaults in `--help` | Instance walk generation when using `--graph` |
 | `--loss-every-steps`, `--loss-epoch-plot`, `--loss-pretrain-steps-plot`, `--no-loss-plots` | — | Loss logging/plots for two-stage runs |
 
 Example script: `scripts/protograph.sh`.
@@ -244,6 +247,27 @@ uv run src/evaluate_embeddings.py <test.txt> -c <checkpoint.pt>
 ```
 
 See `scripts/evaluate.sh` and `scripts/e2e.sh` for dataset-specific paths.
+
+---
+
+## DBpedia (RDF2Vec P1 / P2)
+
+Benchmark entity lists live under [`v1/dbpedia/`](v1/dbpedia/). Build **N-Triples** for protographs and walks with the `dbpedia-build` CLI and the shell drivers in [`scripts/dbpedia/`](scripts/dbpedia/README.md):
+
+```bash
+uv run dbpedia-build --help
+```
+
+Typical flow:
+
+1. **`export-schema`** — extract `rdfs:domain` / `rdfs:range` / `rdfs:subClassOf` from `dbpedia.owl` → `schema_protograph.nt` for `uv run protograph --schema`.
+2. **`filter-instance`** — stream a mapping-based dump (`.nt` / `.nt.bz2`) and keep an undirected **k-hop** neighborhood of your entity URI lists → `instance.nt`, then run `random_walks.py` on that file for stage-2 walks.
+3. **`filter-types`** — keep `rdf:type` rows for the same seeds → `types_seed.nt`.
+4. **`merge-maschine-ontology`** — concatenate schema + types for `train_word2vec.py --ontology` (MASCHInE init).
+5. Optional **`fetch-sparql`** — batched `CONSTRUCT` when you do not have local dumps.
+6. **`build-v1-instance`** — scan all `v1/dbpedia/**/*.txt` for resource IRIs, then extract a **multi-hop** subgraph from a mapping-based dump into `v1/dbpedia/dbpedia.nt` (see [`scripts/dbpedia/README.md`](scripts/dbpedia/README.md)).
+
+End-to-end examples: [`scripts/dbpedia/run_from_dumps.sh`](scripts/dbpedia/run_from_dumps.sh) (offline dumps) and [`scripts/dbpedia/run_from_sparql.sh`](scripts/dbpedia/run_from_sparql.sh) (public endpoint). Evaluate a checkpoint with [`scripts/dbpedia/eval_checkpoint.sh`](scripts/dbpedia/eval_checkpoint.sh).
 
 ---
 

@@ -246,19 +246,24 @@ if schema has many abstract classes that do not have any direct instances, then 
 \subsection{Evaluating the Pretrain Stage}
 In this section we will evaluate on the TC's the pretrained models and compare them to each other. 
 This requires us to evaluate the pretrained embeddings on the test cases without fine-tuning on the instance graph.
-Table~\ref{tab:dlcc-pretrain-stage-eval} compares frozen entity vectors when Word2Vec is trained on instance walks only (\textit{V}) versus weights after protograph pretraining (\textit{P1}, \textit{P2}), each without subsequent fine-tuning on the instance graph.
+Table~\ref{tab:dlcc-pretrain-stage-eval} compares frozen entity vectors under one fixed walk-generation and Word2Vec configuration: training on instance walks from scratch (\textit{V}) versus the same recipe after protograph pretraining (\textit{P1}, \textit{P2}), each without subsequent fine-tuning on the instance graph, so differences between columns isolate the effect of pretraining.
 
 \begingroup
 \newcommand{\D}{\textemdash{}}
 \begin{table}[t]
   \centering
-  \caption{DLCC synthetic ontology: pretrain-stage evaluation. Binary node classification with a logistic regression on frozen entity vectors. \textit{V} denotes embeddings from Word2Vec on instance walks only; \textit{P1} and \textit{P2} denote embeddings after protograph pretraining only. All entries are \textbf{accuracy} on the test set, reported as point estimate $\pm$ bootstrap standard error once runs are complete.}
+  \caption{DLCC synthetic ontology: pretrain-stage evaluation with a \emph{fixed} configuration. Random-walk generation and Word2Vec hyperparameters are identical for all columns; only the initialization/pretraining path differs. }
   \label{tab:dlcc-pretrain-stage-eval}
   \footnotesize
   \setlength{\tabcolsep}{4pt}
   \begin{tabular}{@{}lccc@{}}
     \toprule
-    TC & V & P1 & P2 \\
+    TC
+      & V
+      & P1
+      & P2 \\
+    \multicolumn{4}{@{}l@{}}{%
+    } \\
     \midrule
     TC01 & \D & \D & \D \\
     TC02 & \D & \D & \D \\
@@ -278,7 +283,6 @@ Table~\ref{tab:dlcc-pretrain-stage-eval} compares frozen entity vectors when Wor
     \bottomrule
   \end{tabular}
   \vspace{0.4em}
-  \par\noindent\small\textit{Note:} Macro avg.\ is the unweighted mean of accuracy over TC01--TC12 for each column. Replace placeholders with $m \pm \sigma$ once runs are complete.
 \end{table}
 \endgroup
 
@@ -335,6 +339,49 @@ Table \ref{tab:dlcc-rdf2vec-protograph} shows the results of RDF2Vec models pret
 \end{table}
 \endgroup
 
+\subsection{Initialization Strategies for P2 Protograph}
+So far when working with P2 protograph we have been initializing the instance embeddings with the corresponding most specific class embedding.
+This is a reasonable approach, however it might be the case that it is not the best one.
+For that reason we will explore other initialization strategies for P2 protograph.
+For example, we can initialize instance embeddings with the average of all class embeddings that are connected to the instance. 
+Another approach could be to initialize instance embeddings with the weighted average of all class embeddings, where weights are determined by their distance from the most specific class.
+
+\begingroup
+\newcommand{\D}{\textemdash{}}
+\begin{table}[t]
+  \centering
+  \caption{P2 protograph: comparison of instance embedding initialization strategies (binary node classification accuracy on DLCC).}
+  \label{tab:p2-init-strategies}
+  \footnotesize
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    TC
+      & Most Specific
+      & Average
+      & Weighted \\
+    \midrule
+    TC01 & \D & \D & \D \\
+    TC02 & \D & \D & \D \\
+    TC03 & \D & \D & \D \\
+    TC04 & \D & \D & \D \\
+    TC05 & \D & \D & \D \\
+    TC06 & \D & \D & \D \\
+    TC07 & \D & \D & \D \\
+    TC08 & \D & \D & \D \\
+    TC09 & \D & \D & \D \\
+    TC10 & \D & \D & \D \\
+    TC11 & \D & \D & \D \\
+    TC12 & \D & \D & \D \\
+    \midrule
+    Macro avg.
+      & \D & \D & \D \\
+    \bottomrule
+  \end{tabular}
+  \vspace{0.4em}
+  \par\noindent\small\textit{Note:} Macro avg.\ is the unweighted mean of accuracy over TC01--TC12 for each column. Replace placeholders with reported values once runs are complete.
+\end{table}
+\endgroup
 
 \subsection{Convergence of Protograph Pretrained Model}
 We analyze how quickly Word2Vec training on the instance-graph walks reduces loss when embeddings are initialized in three ways:
@@ -370,8 +417,7 @@ For each difficult test case TC07--TC10, Figure~\ref{fig:protograph-convergence-
   \label{fig:protograph-convergence-loss}
 \end{figure}
 
-
-\subsection{Evaluating Protograph Embeddings}
+\subsection{Evaluating Pretrain Stage}
 So far we have covered (i) the evaluation of RDF2Vec trained on protographs and on instance graph, 
 (ii) convergence of RDF2Vec on instance graph with prograph embeddings initialization.
 
@@ -416,7 +462,7 @@ In order to analyze the pretrained embeddings deeper we evaluate them on DLCC te
 
 \subsection{Dataset: DBpedia Snapshot (2021-09)}
 
-The following DBpedia resources were used:
+The following DBpedia resources were used: 
 
 \begin{itemize}
     \item \textbf{Mapping-based object properties (cleaned)} (\textasciitilde171 MB) \\
@@ -528,6 +574,7 @@ Retained schema relations:
 % What would be the loss function? 
 % 
 bina
+
 \section{Problems of RDF2Vec}
 
 

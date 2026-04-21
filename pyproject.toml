@@ -13,11 +13,13 @@ dependencies = [
     "scikit-learn>=1.4",
     "torch>=2.2",
     "tqdm>=4.66",
+    "pyoxigraph>=0.5.7",
 ]
 
 [project.scripts]
 protograph = "src.protograph:main"
 rdf2vec-train = "src.train.train_word2vec:main"
+dbpedia-build = "src.dbpedia.cli:main"
 
 [build-system]
 requires = ["hatchling"]
