@@ -12,7 +12,7 @@ Input: one space-separated walk per line.
 Single-corpus mode logs per-epoch loss, CSV, PNG, optional per-step loss (--loss-every-steps).
 p1/p2 mode writes pretrain_per_epoch.png and protograph_per_epoch.png; per-step PNGs use
 --loss-every-steps-pretrain / --loss-every-steps-finetune (or --loss-every-steps N for both).
-Writes instance_to_class.json (default): ``{ instance_iri_inner: [ class_iri_inner, ... ] }`` from ontology.nt.
+Writes instance_to_class.json (default): ``{ instance_iri_inner: [ class_iri_inner, ... ] }`` from the ontology file (.nt or .ttl).
 Saves a .pt checkpoint compatible with evaluate_embeddings.py (embeddings + word2idx).
 """
 
@@ -428,9 +428,11 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
 
     ontology_path = args.ontology
     if ontology_path is None:
-        cand = instance_path.parent / "ontology.nt"
-        if cand.is_file():
-            ontology_path = cand
+        for name in ("ontology.nt", "ontology.ttl", "ontology.turtle"):
+            cand = instance_path.parent / name
+            if cand.is_file():
+                ontology_path = cand
+                break
 
     stage1_vectors = {
         w: np.asarray(pre_model.wv[w], dtype=np.float32).copy() for w in pre_model.wv.index_to_key
@@ -453,7 +455,8 @@ def run_rdf2vec_two_stage(args: argparse.Namespace) -> None:
         )
     elif args.maschine_init and (ontology_path is None or not ontology_path.is_file()):
         print(
-            "MASCHInE init skipped (no ontology.nt); pass --ontology or place ontology.nt beside instance walks"
+            "MASCHInE init skipped (no ontology file); pass --ontology or place "
+            "ontology.nt / ontology.ttl beside instance walks",
         )
 
     if not maschine_applied:
@@ -911,8 +914,8 @@ def main() -> None:
         "--ontology",
         type=Path,
         default=None,
-        help="N-Triples ontology with rdf:type and rdfs:subClassOf. "
-        "If omitted, uses <instance-walks-dir>/ontology.nt when present.",
+        help="Ontology with rdf:type and rdfs:subClassOf (.nt or .ttl). "
+        "If omitted, uses <instance-walks-dir>/ontology.nt, ontology.ttl, or ontology.turtle when present.",
     )
     p.add_argument(
         "--maschine-init",

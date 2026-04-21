@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+from rdflib import Graph, URIRef
 from tqdm.auto import tqdm
 
 # Same pattern as convert.py: bare identifiers in angle brackets are accepted.
@@ -45,6 +46,22 @@ class Triple:
     subject: str
     predicate: str
     object: str
+
+
+def _detect_input_format(path: Path, explicit: str | None) -> str:
+    if explicit:
+        explicit = explicit.lower().strip()
+        if explicit in {"nt", "ntriples", "n-triples"}:
+            return "nt"
+        if explicit in {"ttl", "turtle"}:
+            return "turtle"
+        raise SystemExit(f"Unsupported --input-format: {explicit!r} (use: nt|ttl)")
+    suf = path.suffix.lower()
+    if suf == ".nt":
+        return "nt"
+    if suf in {".ttl", ".turtle"}:
+        return "turtle"
+    raise SystemExit(f"Cannot infer input format from extension {path.suffix!r}. Use --input-format nt|ttl.")
 
 
 def iter_nt_triples(path: Path):
@@ -72,6 +89,44 @@ def iter_nt_object_triples_lenient(path: Path):
             yield m.group(1), m.group(2), m.group(3)
 
 
+def iter_turtle_object_triples(path: Path):
+    """
+    IRI–IRI–IRI triples only from a Turtle file.
+
+    Notes:
+    - Requires valid Turtle (prefixes, base, etc.); unlike the .nt path we do not support bare
+      identifiers like <I_tc01_761> unless they are valid IRIs in Turtle.
+    - Literals / blank nodes are skipped to match embedding-walk assumptions.
+    """
+    g = Graph()
+    g.parse(path.as_posix(), format="turtle")
+    for s, p, o in tqdm(
+        g,
+        total=len(g),
+        desc="Scanning Turtle (triples)",
+        unit="triple",
+        dynamic_ncols=True,
+        colour="cyan",
+        mininterval=0.25,
+    ):
+        if not isinstance(s, URIRef) or not isinstance(p, URIRef) or not isinstance(o, URIRef):
+            continue
+        yield str(s), str(p), str(o)
+
+
+def iter_object_triples(path: Path, *, input_format: str, strict_nt: bool) -> tuple[str, str, str]:
+    if input_format == "nt":
+        if strict_nt:
+            yield from iter_nt_triples(path)
+        else:
+            yield from iter_nt_object_triples_lenient(path)
+        return
+    if input_format == "turtle":
+        yield from iter_turtle_object_triples(path)
+        return
+    raise AssertionError(f"Unhandled input_format: {input_format}")
+
+
 def nt_term(inner: str) -> str:
     return f"<{inner}>"
 
@@ -80,32 +135,18 @@ def build_adjacency(
     path: Path,
     *,
     directed: bool,
+    input_format: str,
 ) -> tuple[dict[str, list[str]], list[str]]:
     neighbors: dict[str, set[str]] = defaultdict(set)
     all_nodes: set[str] = set()
-    with path.open(encoding="utf-8") as f:
-        for line in tqdm(
-            f,
-            desc="Scanning N-Triples (adjacency)",
-            unit="line",
-            dynamic_ncols=True,
-            colour="cyan",
-            mininterval=0.25,
-        ):
-            line = line.rstrip("\n")
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-            m = TRIPLE_LINE.match(line)
-            if not m:
-                raise ValueError(f"Unrecognized N-Triples line: {line[:200]}")
-            s, _p, o = m.group(1), m.group(2), m.group(3)
-            all_nodes.add(s)
-            all_nodes.add(o)
-            if directed:
-                neighbors[s].add(o)
-            else:
-                neighbors[s].add(o)
-                neighbors[o].add(s)
+    for s, _p, o in iter_object_triples(path, input_format=input_format, strict_nt=True):
+        all_nodes.add(s)
+        all_nodes.add(o)
+        if directed:
+            neighbors[s].add(o)
+        else:
+            neighbors[s].add(o)
+            neighbors[o].add(s)
 
     adj = {n: list(neighbors[n]) for n in tqdm(all_nodes, desc="Materializing neighbor lists", unit="node", dynamic_ncols=True, colour="cyan", mininterval=0.5)}
     return adj, list(all_nodes)
@@ -132,26 +173,11 @@ def random_walk(
     return walk
 
 
-def build_forward_adjacency(path: Path) -> dict[str, list[Triple]]:
+def build_forward_adjacency(path: Path, *, input_format: str) -> dict[str, list[Triple]]:
     """subject -> outgoing object triples (same as jRDF2Vec ``getObjectTriplesInvolvingSubject``)."""
     adj: dict[str, list[Triple]] = defaultdict(list)
-    with path.open(encoding="utf-8") as f:
-        for line in tqdm(
-            f,
-            desc="Scanning N-Triples (forward adjacency)",
-            unit="line",
-            dynamic_ncols=True,
-            colour="cyan",
-            mininterval=0.25,
-        ):
-            line = line.rstrip("\n")
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-            m = TRIPLE_LINE.match(line)
-            if not m:
-                continue
-            s, p, o = m.group(1), m.group(2), m.group(3)
-            adj[s].append(Triple(s, p, o))
+    for s, p, o in iter_object_triples(path, input_format=input_format, strict_nt=False):
+        adj[s].append(Triple(s, p, o))
     return {k: v for k, v in adj.items()}
 
 
@@ -224,7 +250,7 @@ def walk_triples_to_string(entity: str, triples: list[Triple], *, angled: bool) 
 
 
 def run_jrdf2vec_duplicate_free(
-    input_nt: Path,
+    input_graph: Path,
     output_walks: Path,
     *,
     walks_per_entity: int,
@@ -232,8 +258,9 @@ def run_jrdf2vec_duplicate_free(
     threads: int,
     seed: int | None,
     token_format: str,
+    input_format: str,
 ) -> None:
-    adj = build_forward_adjacency(input_nt)
+    adj = build_forward_adjacency(input_graph, input_format=input_format)
     if not adj:
         raise SystemExit("No object triples found; nothing to walk on.")
     entities = collect_jrdf2vec_entities(adj)
@@ -280,9 +307,14 @@ def run_jrdf2vec_duplicate_free(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Random walks on an N-Triples knowledge graph.")
-    p.add_argument("input_nt", type=Path, help="Path to input .nt file")
+    p = argparse.ArgumentParser(description="Random walks on an RDF graph (.nt or .ttl).")
+    p.add_argument("input_graph", type=Path, help="Path to input graph file (.nt or .ttl)")
     p.add_argument("output_walks", type=Path, help="Path to output walks file (one walk per line)")
+    p.add_argument(
+        "--input-format",
+        default=None,
+        help="Optional: nt or ttl. If omitted, inferred from file extension.",
+    )
     p.add_argument(
         "--mode",
         choices=("classic", "jrdf2vec-duplicate-free"),
@@ -337,19 +369,22 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=None, help="RNG seed (classic); also seeds per-entity trim in jrdf2vec mode")
     args = p.parse_args()
 
+    input_format = _detect_input_format(args.input_graph, args.input_format)
+
     if args.mode == "jrdf2vec-duplicate-free":
         if args.walks_per_entity < 1:
             raise SystemExit("--walks-per-entity must be at least 1")
         if args.depth < 1:
             raise SystemExit("--depth must be at least 1")
         run_jrdf2vec_duplicate_free(
-            args.input_nt,
+            args.input_graph,
             args.output_walks,
             walks_per_entity=args.walks_per_entity,
             depth=args.depth,
             threads=args.threads,
             seed=args.seed,
             token_format=args.token_format,
+            input_format=input_format,
         )
         return
 
@@ -359,7 +394,7 @@ def main() -> None:
         raise SystemExit("--walk-length must be at least 1")
 
     rng = random.Random(args.seed)
-    adj, nodes = build_adjacency(args.input_nt, directed=args.directed)
+    adj, nodes = build_adjacency(args.input_graph, directed=args.directed, input_format=input_format)
     if not nodes:
         raise SystemExit("No triples found; nothing to walk on.")
 

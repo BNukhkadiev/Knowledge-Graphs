@@ -13,7 +13,9 @@ train.txt embeddings and reports test metrics with bootstrap standard errors.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -50,6 +52,8 @@ def tokens_to_embeddings(
     word2idx: dict[str, int],
     desc: str,
     chunk_size: int,
+    *,
+    progress: bool = True,
 ) -> tuple[np.ndarray, int]:
     """Map tokens to embedding rows; OOV tokens get a zero vector. Returns (matrix, n_oov)."""
     def _candidates(t: str) -> tuple[str, ...]:
@@ -74,6 +78,7 @@ def tokens_to_embeddings(
         colour="green",
         leave=False,
         unit="chunk",
+        disable=not progress,
         bar_format="{desc} |{bar}| {n_fmt}/{total_fmt} chunks [{elapsed}<{remaining}, {rate_fmt}]",
     ):
         end = min(start + chunk_size, n)
@@ -95,6 +100,8 @@ def bootstrap_metrics(
     y_pred: np.ndarray,
     n_boot: int,
     seed: int,
+    *,
+    progress: bool = True,
 ) -> dict[str, tuple[float, float]]:
     """Return metric -> (point_estimate, bootstrap_std). Point estimate on full test set."""
     rng = np.random.default_rng(seed)
@@ -120,6 +127,7 @@ def bootstrap_metrics(
         dynamic_ncols=True,
         colour="cyan",
         unit="draw",
+        disable=not progress,
         bar_format="{desc} |{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
     ):
         idx = rng.integers(0, n, size=n)
@@ -165,14 +173,106 @@ def load_embeddings_checkpoint(path: Path) -> tuple[np.ndarray, dict[str, int]]:
 
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if "embeddings" not in ckpt or "word2idx" not in ckpt:
-        raise SystemExit(
+        raise ValueError(
             "Checkpoint must contain 'embeddings' and 'word2idx', or use a .kv / .model file."
         )
     emb_t = ckpt["embeddings"]
     if emb_t.dim() != 2:
-        raise SystemExit("'embeddings' must be 2D [vocab, dim].")
+        raise ValueError("'embeddings' must be 2D [vocab, dim].")
     emb = emb_t.detach().cpu().numpy().astype(np.float32, copy=False)
     return emb, ckpt["word2idx"]
+
+
+def run_evaluation(
+    test_path: Path,
+    checkpoint_path: Path,
+    *,
+    train_path: Path | None = None,
+    bootstrap: int = 1000,
+    seed: int = 42,
+    max_iter: int = 1000,
+    chunk_size: int = 2048,
+    progress: bool = True,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """
+    Train logistic regression on train embeddings and return test metrics (+ bootstrap std).
+
+    Raises FileNotFoundError if paths are missing, ValueError for invalid labeled data or
+    checkpoint format.
+    """
+    test_path = test_path.resolve()
+    checkpoint_path = checkpoint_path.resolve()
+    tr_path = (
+        train_path.resolve()
+        if train_path is not None
+        else default_train_path(test_path).resolve()
+    )
+    if not tr_path.is_file():
+        raise FileNotFoundError(f"Training file not found: {tr_path}")
+    if not test_path.is_file():
+        raise FileNotFoundError(f"Test file not found: {test_path}")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    emb, word2idx = load_embeddings_checkpoint(checkpoint_path)
+    train_tokens, y_train = load_labeled_txt(tr_path)
+    test_tokens, y_test = load_labeled_txt(test_path)
+
+    if verbose:
+        tqdm.write(
+            f"Train rows: {len(train_tokens)}  |  Test rows: {len(test_tokens)}"
+        )
+        tqdm.write(f"Embedding matrix: {emb.shape[0]} x {emb.shape[1]}")
+
+    X_train, oov_tr = tokens_to_embeddings(
+        train_tokens,
+        emb,
+        word2idx,
+        "Embed train entities",
+        chunk_size,
+        progress=progress,
+    )
+    clf = LogisticRegression(max_iter=max_iter, random_state=seed)
+    if verbose:
+        tqdm.write("Fitting logistic regression on train embeddings…")
+    clf.fit(X_train, y_train)
+
+    X_test, oov_te = tokens_to_embeddings(
+        test_tokens,
+        emb,
+        word2idx,
+        "Embed test entities",
+        chunk_size,
+        progress=progress,
+    )
+    if verbose and (oov_tr or oov_te):
+        tqdm.write(
+            f"Note: OOV tokens (zero vector): train={oov_tr}, test={oov_te}"
+        )
+    if verbose:
+        tqdm.write("Predicting on test set…")
+    y_pred = clf.predict(X_test)
+    metrics = bootstrap_metrics(y_test, y_pred, bootstrap, seed, progress=progress)
+
+    out: dict[str, Any] = {
+        "test_path": str(test_path),
+        "train_path": str(tr_path),
+        "checkpoint_path": str(checkpoint_path),
+        "n_train": len(train_tokens),
+        "n_test": len(test_tokens),
+        "emb_vocab": int(emb.shape[0]),
+        "emb_dim": int(emb.shape[1]),
+        "oov_train": oov_tr,
+        "oov_test": oov_te,
+        "bootstrap": bootstrap,
+        "seed": seed,
+    }
+    for name in ("accuracy", "precision", "recall", "f1"):
+        val, std = metrics[name]
+        out[name] = val
+        out[f"{name}_std"] = std
+    return out
 
 
 def main() -> None:
@@ -229,49 +329,37 @@ def main() -> None:
     if not args.checkpoint.is_file():
         raise SystemExit(f"Checkpoint not found: {args.checkpoint}")
 
-    emb, word2idx = load_embeddings_checkpoint(args.checkpoint)
+    try:
+        res = run_evaluation(
+            args.test,
+            args.checkpoint,
+            train_path=train_path,
+            bootstrap=args.bootstrap,
+            seed=args.seed,
+            max_iter=args.max_iter,
+            chunk_size=args.chunk_size,
+            progress=True,
+        )
+    except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(str(e)) from e
 
-    train_tokens, y_train = load_labeled_txt(train_path)
-    test_tokens, y_test = load_labeled_txt(args.test)
-
-    tqdm.write(f"Train rows: {len(train_tokens)}  |  Test rows: {len(test_tokens)}")
-    tqdm.write(f"Embedding matrix: {emb.shape[0]} x {emb.shape[1]}")
-
-    X_train, oov_tr = tokens_to_embeddings(
-        train_tokens,
-        emb,
-        word2idx,
-        desc="Embed train entities",
-        chunk_size=args.chunk_size,
+    tqdm.write(
+        f"Train rows: {res['n_train']}  |  Test rows: {res['n_test']}"
     )
-    clf = LogisticRegression(
-        max_iter=args.max_iter,
-        random_state=args.seed,
-    )
+    tqdm.write(f"Embedding matrix: {res['emb_vocab']} x {res['emb_dim']}")
     tqdm.write("Fitting logistic regression on train embeddings…")
-    clf.fit(X_train, y_train)
-
-    X_test, oov_te = tokens_to_embeddings(
-        test_tokens,
-        emb,
-        word2idx,
-        desc="Embed test entities",
-        chunk_size=args.chunk_size,
-    )
-    if oov_tr or oov_te:
-        tqdm.write(f"Note: OOV tokens (zero vector): train={oov_tr}, test={oov_te}")
-
+    if res["oov_train"] or res["oov_test"]:
+        tqdm.write(
+            f"Note: OOV tokens (zero vector): train={res['oov_train']}, test={res['oov_test']}"
+        )
     tqdm.write("Predicting on test set…")
-    y_pred = clf.predict(X_test)
-
-    results = bootstrap_metrics(y_test, y_pred, args.bootstrap, args.seed)
 
     print()
     print("─" * 52)
     print("Test metrics (binary classification, positive class = 1)")
     print("─" * 52)
     for name in ("accuracy", "precision", "recall", "f1"):
-        val, std = results[name]
+        val, std = res[name], res[f"{name}_std"]
         if args.bootstrap > 0:
             print(f"  {name:12s}  {val:.4f}  ±  {std:.4f}  (bootstrap std)")
         else:
